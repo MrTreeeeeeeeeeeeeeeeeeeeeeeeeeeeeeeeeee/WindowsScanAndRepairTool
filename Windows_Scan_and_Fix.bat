@@ -357,7 +357,7 @@ function New-ScanHtmlReport {
 
     # Section 3: Detailed Results
     [void]$sb.AppendLine('  <div class="section">')
-    [void]$sb.AppendLine('    <h2>3. Detailed Results (All 9 Checks)</h2>')
+    [void]$sb.AppendLine("    <h2>3. Detailed Results (All $totalCount Checks)</h2>")
     foreach ($r in $results) {
         $name = Escape-Html ([string](Get-SafeProp $r 'Name' ''))
         $cmd = Escape-Html ([string](Get-SafeProp $r 'Command' ''))
@@ -648,6 +648,7 @@ function Invoke-WindowsScanAndFix {
 
     $rawLogPath = Join-Path $runDir 'raw_scan_log.txt'
     $energyHtmlPath = Join-Path $runDir 'energy-report.html'
+    $batteryHtmlPath = Join-Path $runDir 'battery-report.html'
     $archiveReportPath = Join-Path $runDir 'Windows_Scan_Report.html'
     $desktopReportPath = Join-Path $desktopDir "Windows_Scan_Report_$stamp.html"
 
@@ -669,16 +670,22 @@ function Invoke-WindowsScanAndFix {
     Write-Host '                    WINDOWS SCAN AND FIX TOOL                       ' -ForegroundColor Cyan
     Write-Host '====================================================================' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host 'This automated tool will run all 9 health, security, and repair checks:'
-    Write-Host '  1/9  Physical Disk Health      (Get-PhysicalDisk + SMART counters)'
-    Write-Host '  2/9  Power & Energy Check      (powercfg /energy - 60s idle trace)'
-    Write-Host '  3/9  Reliability History       (perfmon /rel crash & stability data)'
-    Write-Host '  4/9  DISM Health Scan          (DISM /Online /Cleanup-Image /ScanHealth)'
-    Write-Host '  5/9  DISM Component Repair     (DISM /Online /Cleanup-Image /RestoreHealth)'
-    Write-Host '  6/9  System File Integrity     (sfc /scannow)'
-    Write-Host '  7/9  All Connected Drives      (chkdsk /scan on all mounted drives)'
-    Write-Host '  8/9  Defender Antivirus Scan   (Start-MpScan -ScanType FullScan)'
-    Write-Host '  9/9  Memory Diagnostic Queue   (mdsched / bootsequence {memdiag})'
+    Write-Host 'This automated tool will run 15 health, security, and repair checks:'
+    Write-Host '   1/15  Physical Disks & Space   (Get-PhysicalDisk + SMART + Free Space)'
+    Write-Host '   2/15  Power, Energy & Battery  (powercfg /energy + /batteryreport)'
+    Write-Host '   3/15  Reliability & Crash Logs (perfmon /rel + WHEA/Disk/BSOD dumps)'
+    Write-Host '   4/15  Device Manager Drivers   (Win32_PnPEntity broken driver check)'
+    Write-Host '   5/15  Security & HVCI Posture  (Memory Integrity + Firewall + Defender)'
+    Write-Host '   6/15  WMI Repository Repair    (winmgmt /verify & /salvagerepository)'
+    Write-Host '   7/15  DISM Health Scan         (DISM /Online /Cleanup-Image /ScanHealth)'
+    Write-Host '   8/15  DISM Repair & Cleanup    (DISM /RestoreHealth + /StartComponentCleanup)'
+    Write-Host '   9/15  System File Integrity    (sfc /scannow)'
+    Write-Host '  10/15  All Connected Drives     (chkdsk /scan on all mounted drives)'
+    Write-Host '  11/15  SSD TRIM & Temp Cleanup  (Optimize-Volume -ReTrim + stale temp)'
+    Write-Host '  12/15  Network, DNS & Clock     (flushdns + winsock reset + w32tm)'
+    Write-Host '  13/15  Core Windows Services    (Auto-start critical stopped services)'
+    Write-Host '  14/15  Defender Antivirus Scan  (Start-MpScan -ScanType FullScan)'
+    Write-Host '  15/15  Memory Diagnostic Queue  (mdsched / bootsequence {memdiag})'
     Write-Host ''
     Write-Host 'IMPORTANT:' -ForegroundColor Yellow
     Write-Host '  - Save any open work now. A full Defender scan can take 30 min - 2+ hours.'
@@ -700,12 +707,12 @@ function Invoke-WindowsScanAndFix {
     $offlineChkdskScheduled = $false
 
     # ------------------------------------------------------------------
-    # STEP 1/9: Physical Disk Health (Get-PhysicalDisk)
+    # STEP 1/15: Physical Disk Health & Free Space (Get-PhysicalDisk)
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[1/9] Checking Physical Disk Health (Get-PhysicalDisk)...' -ForegroundColor Cyan
+    Write-Host '[1/15] Checking Physical Disk Health & Free Space (Get-PhysicalDisk)...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog '--- [1/9] Get-PhysicalDisk ---' $rawLogPath
+    Write-RawLog '--- [1/15] Get-PhysicalDisk & Free Space ---' $rawLogPath
     try {
         $disks = @(Get-PhysicalDisk -ErrorAction Stop)
         if ($disks.Count -eq 0) {
@@ -787,16 +794,49 @@ function Invoke-WindowsScanAndFix {
                 }
             }
 
+            # Check free space on fixed drives
+            $diskLines.Add('')
+            $diskLines.Add('Fixed Volume Free Space:')
+            $fixedVols = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Sort-Object DeviceID)
+            foreach ($fv in $fixedVols) {
+                $did = [string](Get-SafeProp $fv 'DeviceID' '')
+                $sz = [double](Get-SafeProp $fv 'Size' 0)
+                $fr = [double](Get-SafeProp $fv 'FreeSpace' 0)
+                if ($sz -le 0) { continue }
+                $frGb = [math]::Round($fr / 1GB, 1)
+                $szGb = [math]::Round($sz / 1GB, 1)
+                $frPct = [math]::Round(($fr / $sz) * 100, 1)
+                $spaceLine = "  $did ${frGb} GB free of ${szGb} GB (${frPct}% free)"
+                $diskLines.Add($spaceLine)
+                Write-Host "  $spaceLine"
+
+                if ($did -ieq $env:SystemDrive -and ($frGb -lt 5 -or $frPct -lt 5)) {
+                    $diskHasIssue = $true
+                    $attentionItems.Add([PSCustomObject]@{
+                        Severity='High'; Source="Disk Space ($did)"
+                        Title="System drive $did is critically low on free space (${frGb} GB / ${frPct}% free)."
+                        Action='Free up space right away (Windows Updates, apps, and virtual memory need at least 15-20 GB free).'
+                    })
+                } elseif (($did -ieq $env:SystemDrive -and ($frGb -lt 15 -or $frPct -lt 10)) -or ($frPct -lt 8 -and $frGb -lt 10)) {
+                    $diskHasIssue = $true
+                    $attentionItems.Add([PSCustomObject]@{
+                        Severity='Medium'; Source="Disk Space ($did)"
+                        Title="Drive $did is running low on free space (${frGb} GB / ${frPct}% free)."
+                        Action='Review Storage Sense or uninstall unused apps/large files to keep SSD performance healthy.'
+                    })
+                }
+            }
+
             $detailsTxt = ($diskLines -join "`r`n")
             Write-RawLog $detailsTxt $rawLogPath
             $status = if ($diskHasIssue) { 'ATTENTION' } else { 'OK' }
             $summary = if ($diskHasIssue) {
-                "Checked $($disks.Count) physical disk(s); hardware health warning(s) detected."
+                "Checked $($disks.Count) physical disk(s) and $($fixedVols.Count) fixed volume(s); health or free-space warning(s) detected."
             } else {
-                "All $($disks.Count) physical disk(s) report Healthy / OK."
+                "All $($disks.Count) physical disk(s) report Healthy / OK with adequate free space."
             }
             $results.Add([PSCustomObject]@{
-                Id='disk_health'; Order=1; Name='1. Physical Disk Health'; Command='Get-PhysicalDisk | Get-StorageReliabilityCounter'
+                Id='disk_health'; Order=1; Name='1. Physical Disk Health & Free Space'; Command='Get-PhysicalDisk | Get-StorageReliabilityCounter + Free Space'
                 Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
                 Summary=$summary; Details=$detailsTxt; ExtraLinkPath=''; ExtraLinkLabel=''
             })
@@ -817,12 +857,12 @@ function Invoke-WindowsScanAndFix {
     }
 
     # ------------------------------------------------------------------
-    # STEP 2/9: Power & Energy Diagnostics (powercfg /energy)
+    # STEP 2/15: Power, Energy & Battery Diagnostics (powercfg /energy)
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[2/9] Running Power & Energy Analysis (powercfg /energy - ~60 seconds)...' -ForegroundColor Cyan
+    Write-Host '[2/15] Running Power, Energy & Battery Analysis (powercfg /energy - ~60s)...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [2/9] powercfg /energy ---" $rawLogPath
+    Write-RawLog "`r`n--- [2/15] powercfg /energy & /batteryreport ---" $rawLogPath
     try {
         $pwrRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'powercfg.exe') -Arguments "/energy /output `"$energyHtmlPath`" /duration 60"
         $pwrOut = ($pwrRes.Output + "`r`n" + $pwrRes.Error).Trim()
@@ -853,8 +893,41 @@ function Invoke-WindowsScanAndFix {
             }
         }
 
+        $batteryNote = 'Battery: None detected (desktop PC).'
+        $batteryLowHealth = $false
+        try {
+            $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+            if ($batteries.Count -gt 0) {
+                $batRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'powercfg.exe') -Arguments "/batteryreport /output `"$batteryHtmlPath`""
+                Write-RawLog ($batRes.Output + "`r`n" + $batRes.Error).Trim() $rawLogPath
+                if (Test-Path -LiteralPath $batteryHtmlPath) {
+                    $bHtml = [System.IO.File]::ReadAllText($batteryHtmlPath, [System.Text.Encoding]::UTF8)
+                    $designCap = 0; $fullCap = 0
+                    if ($bHtml -match 'DESIGN CAPACITY</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $designCap = [int]($matches[1] -replace ',', '') }
+                    if ($bHtml -match 'FULL CHARGE CAPACITY</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $fullCap = [int]($matches[1] -replace ',', '') }
+                    if ($designCap -gt 0 -and $fullCap -gt 0) {
+                        $batPct = [math]::Round(($fullCap / $designCap) * 100, 1)
+                        $batteryNote = "Battery Health: ${batPct}% ($fullCap mWh / $designCap mWh design). Report: $batteryHtmlPath"
+                        if ($batPct -lt 70) {
+                            $batteryLowHealth = $true
+                            $attentionItems.Add([PSCustomObject]@{
+                                Severity='Medium'; Source='Battery Health (powercfg /batteryreport)'
+                                Title="Laptop battery capacity has degraded to ${batPct}% of original design capacity."
+                                Action="Open $batteryHtmlPath to inspect battery wear and consider a replacement battery if runtime is poor."
+                            })
+                        }
+                    } else {
+                        $batteryNote = "Battery report saved to: $batteryHtmlPath"
+                    }
+                }
+            }
+        } catch {
+            # Non-fatal battery check error
+        }
+
         $detailsList = New-Object 'System.Collections.Generic.List[string]'
         $detailsList.Add("Errors: $errCount | Warnings: $warnCount | Informational: $infoCount")
+        $detailsList.Add($batteryNote)
         if ($topErrors.Count -gt 0) {
             $detailsList.Add('')
             $detailsList.Add('Top Error Entries:')
@@ -865,15 +938,17 @@ function Invoke-WindowsScanAndFix {
             $detailsList.Add($pwrOut)
         }
 
-        if ($errCount -gt 0) {
+        if ($errCount -gt 0 -or $batteryLowHealth) {
             $status = 'ATTENTION'
-            $summary = "Found $errCount energy error(s), $warnCount warning(s), and $infoCount informational note(s)."
-            $topSnippet = if ($topErrors.Count -gt 0) { ' Top finding: ' + $topErrors[0] } else { '' }
-            $attentionItems.Add([PSCustomObject]@{
-                Severity='Medium'; Source='Power & Energy (powercfg /energy)'
-                Title="Powercfg energy trace reported $errCount error(s) and $warnCount warning(s)."
-                Action="Open $energyHtmlPath to review power policy, USB suspend, or sleep state issues.$topSnippet"
-            })
+            $summary = "Found $errCount energy error(s), $warnCount warning(s), $infoCount info. $batteryNote"
+            if ($errCount -gt 0) {
+                $topSnippet = if ($topErrors.Count -gt 0) { ' Top finding: ' + $topErrors[0] } else { '' }
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='Medium'; Source='Power & Energy (powercfg /energy)'
+                    Title="Powercfg energy trace reported $errCount error(s) and $warnCount warning(s)."
+                    Action="Open $energyHtmlPath to review power policy, USB suspend, or sleep state issues.$topSnippet"
+                })
+            }
         } elseif ($pwrRes.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $energyHtmlPath)) {
             $status = 'ATTENTION'
             $summary = "powercfg /energy exited with code $($pwrRes.ExitCode) without producing an HTML report."
@@ -884,11 +959,11 @@ function Invoke-WindowsScanAndFix {
             })
         } else {
             $status = 'OK'
-            $summary = "0 energy errors found ($warnCount warning(s), $infoCount informational)."
+            $summary = "0 energy errors found ($warnCount warning(s), $infoCount info). $batteryNote"
         }
 
         $results.Add([PSCustomObject]@{
-            Id='power_energy'; Order=2; Name='2. Power & Energy Diagnostics'; Command="powercfg /energy /output `"$energyHtmlPath`""
+            Id='power_energy'; Order=2; Name='2. Power, Energy & Battery Diagnostics'; Command="powercfg /energy /output `"$energyHtmlPath`" (+ /batteryreport if laptop)"
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$summary; Details=($detailsList -join "`r`n")
             ExtraLinkPath=(if (Test-Path -LiteralPath $energyHtmlPath) { $energyHtmlPath } else { '' })
@@ -898,19 +973,19 @@ function Invoke-WindowsScanAndFix {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='power_energy'; Order=2; Name='2. Power & Energy Diagnostics'; Command='powercfg /energy'
+            Id='power_energy'; Order=2; Name='2. Power, Energy & Battery Diagnostics'; Command='powercfg /energy'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="powercfg /energy failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     }
 
     # ------------------------------------------------------------------
-    # STEP 3/9: Reliability History (perfmon /rel data)
+    # STEP 3/15: Reliability History, BSODs & Hardware Error Logs (perfmon /rel)
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[3/9] Collecting System Reliability History (perfmon /rel data)...' -ForegroundColor Cyan
+    Write-Host '[3/15] Collecting Reliability History, BSOD & Hardware Error Logs...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [3/9] Reliability History (perfmon /rel) ---" $rawLogPath
+    Write-RawLog "`r`n--- [3/15] Reliability History (perfmon /rel) + Hardware/BSOD Logs ---" $rawLogPath
     try {
         $metrics = @(Get-CimInstance -ClassName Win32_ReliabilityStabilityMetrics -ErrorAction Stop | Sort-Object TimeGenerated -Descending)
         $latestScore = if ($metrics.Count -gt 0) { [math]::Round([double](Get-SafeProp $metrics[0] 'SystemStabilityIndex' 0), 2) } else { $null }
@@ -973,10 +1048,30 @@ function Invoke-WindowsScanAndFix {
             }
         }
 
+        # Check WHEA hardware errors, disk/NVMe/NTFS errors, and BSOD minidumps (last 30 days)
+        $hwEvents = @()
+        try {
+            $hwEvents = @(Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                ProviderName = @('Microsoft-Windows-WHEA-Logger', 'disk', 'stornvme', 'Ntfs', 'Microsoft-Windows-WER-SystemErrorReporting')
+                Level        = @(1, 2)
+                StartTime    = $cutoff
+            } -MaxEvents 25 -ErrorAction SilentlyContinue)
+        } catch {
+            $hwEvents = @()
+        }
+
+        $minidumps = @()
+        $dumpDir = Join-Path $env:SystemRoot 'Minidump'
+        if (Test-Path -LiteralPath $dumpDir) {
+            $minidumps = @(Get-ChildItem -LiteralPath $dumpDir -Filter '*.dmp' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cutoff } | Sort-Object LastWriteTime -Descending)
+        }
+
         $scoreText = if ($null -ne $latestScore) { "$latestScore / 10" } else { 'Unavailable' }
         $relLines = New-Object 'System.Collections.Generic.List[string]'
         $relLines.Add("Current System Stability Index: $scoreText")
         $relLines.Add("Last 30 Days: OS/Unexpected Shutdowns=$osCrashes, App Crashes/Hangs=$appIssues, Update Failures=$updateFails, Installer Failures=$msiFails")
+        $relLines.Add("Hardware/Disk Critical+Error Events (30d): $($hwEvents.Count) | BSOD Minidumps (30d): $($minidumps.Count)")
         $topGrouped = @($grouped.Values | Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Latest';Descending=$true} | Select-Object -First 12)
         if ($topGrouped.Count -gt 0) {
             $relLines.Add('')
@@ -985,10 +1080,33 @@ function Invoke-WindowsScanAndFix {
                 $relLines.Add("  - [$($g.Category)] $($g.Item): $($g.Count)x (latest: $($g.Latest.ToString('yyyy-MM-dd HH:mm')))")
             }
         }
+        if ($hwEvents.Count -gt 0) {
+            $relLines.Add('')
+            $relLines.Add('Recent System Hardware / Disk / BugCheck Events:')
+            foreach ($he in ($hwEvents | Select-Object -First 8)) {
+                $firstLine = (([string]$he.Message) -split "`r?`n")[0]
+                if ($firstLine.Length -gt 140) { $firstLine = $firstLine.Substring(0, 140) + '...' }
+                $relLines.Add("  - [$($he.TimeCreated.ToString('yyyy-MM-dd HH:mm'))] $($he.ProviderName) (ID $($he.Id)): $firstLine")
+            }
+        }
+        if ($minidumps.Count -gt 0) {
+            $relLines.Add('')
+            $relLines.Add('Recent BSOD Minidump Files:')
+            foreach ($md in ($minidumps | Select-Object -First 5)) {
+                $relLines.Add("  - $($md.FullName) ($($md.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))")
+            }
+        }
         $relDetails = $relLines -join "`r`n"
         Write-RawLog $relDetails $rawLogPath
-        Write-Host "  Stability Index: $scoreText | OS Crashes: $osCrashes | App Crashes/Hangs: $appIssues | Update Fails: $updateFails"
+        Write-Host "  Stability Index: $scoreText | OS Crashes: $osCrashes | App Crashes/Hangs: $appIssues | HW/Disk Errors: $($hwEvents.Count) | BSOD Dumps: $($minidumps.Count)"
 
+        if ($hwEvents.Count -gt 0 -or $minidumps.Count -gt 0) {
+            $attentionItems.Add([PSCustomObject]@{
+                Severity='High'; Source='Hardware / Crash Logs (System Event Log)'
+                Title="Found $($hwEvents.Count) hardware/disk error event(s) and $($minidumps.Count) BSOD minidump(s) in the last 30 days."
+                Action='Review the Reliability section details for WHEA/disk/NVMe errors or inspect Event Viewer -> Windows Logs -> System.'
+            })
+        }
         if ($osCrashes -gt 0) {
             $status = 'ATTENTION'
             $attentionItems.Add([PSCustomObject]@{
@@ -996,6 +1114,8 @@ function Invoke-WindowsScanAndFix {
                 Title="$osCrashes OS crash(es) or unexpected shutdown(s) recorded in the last 30 days (Stability: $scoreText)."
                 Action='Press Win+R and run "perfmon /rel" to inspect the exact red X crash events on the timeline.'
             })
+        } elseif ($hwEvents.Count -gt 0 -or $minidumps.Count -gt 0) {
+            $status = 'ATTENTION'
         } elseif (($null -ne $latestScore -and $latestScore -lt 5.0) -or $appIssues -ge 5 -or $updateFails -gt 0) {
             $status = 'ATTENTION'
             $attentionItems.Add([PSCustomObject]@{
@@ -1008,28 +1128,266 @@ function Invoke-WindowsScanAndFix {
         }
 
         $results.Add([PSCustomObject]@{
-            Id='reliability'; Order=3; Name='3. System Reliability History'; Command='perfmon /rel (Win32_ReliabilityStabilityMetrics & Records)'
+            Id='reliability'; Order=3; Name='3. Reliability History & Crash/Hardware Logs'; Command='perfmon /rel + WHEA/Disk/NTFS Event Logs + Minidumps'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
-            Summary="Stability Index: $scoreText | Last 30 days: $osCrashes system crash(es), $appIssues app crash/hang(s), $updateFails update failure(s)."
+            Summary="Stability: $scoreText | 30d: $osCrashes OS crash(es), $appIssues app crash/hang(s), $updateFails update fail(s), $($hwEvents.Count) HW/disk error(s), $($minidumps.Count) BSOD dump(s)."
             Details=$relDetails; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     } catch {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='reliability'; Order=3; Name='3. System Reliability History'; Command='perfmon /rel (WMI query)'
+            Id='reliability'; Order=3; Name='3. Reliability History & Crash/Hardware Logs'; Command='perfmon /rel (WMI query)'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="Could not query Reliability Monitor data: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     }
 
     # ------------------------------------------------------------------
-    # STEP 4/9: DISM Health Scan (/ScanHealth)
+    # STEP 4/15: Device Manager & Broken Drivers (Win32_PnPEntity)
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[4/9] Scanning Windows Image Health (DISM /ScanHealth)...' -ForegroundColor Cyan
+    Write-Host '[4/15] Checking Device Manager for broken or missing drivers...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [4/9] DISM /ScanHealth ---" $rawLogPath
+    Write-RawLog "`r`n--- [4/15] Device Manager Broken Drivers (Win32_PnPEntity) ---" $rawLogPath
+    try {
+        $codeMap = @{
+            1  = 'Device not configured correctly'
+            10 = 'Device failed to start'
+            12 = 'Not enough free resources'
+            18 = 'Reinstall drivers for this device'
+            19 = 'Registry configuration damaged'
+            22 = 'Device disabled by user'
+            28 = 'Drivers are not installed'
+            31 = 'Windows cannot load required drivers'
+            32 = 'Driver service disabled'
+            37 = 'Driver failed initialization'
+            39 = 'Driver corrupted or missing'
+            43 = 'Device reported problems and was stopped'
+            45 = 'Device not currently connected'
+            48 = 'Driver blocked due to known compatibility issues'
+            52 = 'Unsigned driver blocked by Windows'
+            56 = 'Windows still setting up class configuration'
+        }
+        $pnpErrs = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop)
+        $brokenDevs = New-Object 'System.Collections.Generic.List[string]'
+        $infoDevs = New-Object 'System.Collections.Generic.List[string]'
+
+        foreach ($dev in $pnpErrs) {
+            $dName = [string](Get-SafeProp $dev 'Name' 'Unknown Device')
+            $dCode = [int](Get-SafeProp $dev 'ConfigManagerErrorCode' 0)
+            $dId = [string](Get-SafeProp $dev 'DeviceID' '')
+            $desc = if ($codeMap.ContainsKey($dCode)) { $codeMap[$dCode] } else { "Error Code $dCode" }
+            $entry = "$dName [Code $dCode - $desc] ($dId)"
+
+            if ($dCode -eq 22 -or ($dCode -eq 56 -and $dName -match 'Wi-Fi Direct|WAN Miniport|Virtual')) {
+                $infoDevs.Add($entry)
+            } else {
+                $brokenDevs.Add($entry)
+            }
+        }
+
+        $pnpDetailLines = New-Object 'System.Collections.Generic.List[string]'
+        $pnpDetailLines.Add("Broken / Problem Devices: $($brokenDevs.Count)")
+        foreach ($b in $brokenDevs) { $pnpDetailLines.Add("  [ERROR] $b") }
+        if ($infoDevs.Count -gt 0) {
+            $pnpDetailLines.Add('')
+            $pnpDetailLines.Add("Disabled or Idle Virtual Devices (Informational): $($infoDevs.Count)")
+            foreach ($inf in $infoDevs) { $pnpDetailLines.Add("  [INFO]  $inf") }
+        }
+        $pnpDetails = $pnpDetailLines -join "`r`n"
+        Write-RawLog $pnpDetails $rawLogPath
+        Write-Host "  Broken drivers: $($brokenDevs.Count) | Disabled/Virtual info: $($infoDevs.Count)"
+
+        if ($brokenDevs.Count -gt 0) {
+            $status = 'ATTENTION'
+            $summary = "Found $($brokenDevs.Count) device(s) with driver or hardware errors in Device Manager."
+            $attentionItems.Add([PSCustomObject]@{
+                Severity='Medium'; Source='Device Manager (Drivers)'
+                Title="$($brokenDevs.Count) device(s) have broken or missing drivers."
+                Action='Open Device Manager (Win+X -> Device Manager) and update or reinstall drivers for devices marked with a warning icon.'
+            })
+        } else {
+            $status = 'OK'
+            $summary = "No broken drivers detected in Device Manager ($($infoDevs.Count) intentionally disabled/idle virtual device(s))."
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='drivers'; Order=4; Name='4. Device Manager & Driver Health'; Command='Get-CimInstance Win32_PnPEntity (ConfigManagerErrorCode <> 0)'
+            Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary=$summary; Details=$pnpDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='drivers'; Order=4; Name='4. Device Manager & Driver Health'; Command='Win32_PnPEntity'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="Could not inspect Device Manager: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 5/15: Windows Security & Memory Integrity (HVCI) Posture
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[5/15] Checking Windows Security & Memory Integrity (HVCI)...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [5/15] Security Posture & Memory Integrity (HVCI) ---" $rawLogPath
+    try {
+        $secLines = New-Object 'System.Collections.Generic.List[string]'
+        $secIssues = 0
+
+        # Memory Integrity (HVCI) via DeviceGuard
+        $hvciOn = $false
+        try {
+            $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName 'Win32_DeviceGuard' -ErrorAction Stop
+            $runningSvcs = @(Get-SafeProp $dg 'SecurityServicesRunning' @())
+            $vbsState = [int](Get-SafeProp $dg 'VirtualizationBasedSecurityStatus' 0)
+            $hvciOn = ($runningSvcs -contains 2)
+            $secLines.Add("Core Isolation - Memory Integrity (HVCI): $(if ($hvciOn) { 'ENABLED (Running)' } else { 'DISABLED (Not running)' }) [VBS Status=$vbsState]")
+            if (-not $hvciOn) {
+                $secIssues++
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='Medium'; Source='Windows Security (Memory Integrity)'
+                    Title='Core Isolation Memory Integrity (HVCI) is turned OFF.'
+                    Action='Open Windows Security -> Device security -> Core isolation details to review or enable Memory Integrity (incompatible drivers may be listed there).'
+                })
+            }
+        } catch {
+            $secLines.Add("Core Isolation - Memory Integrity (HVCI): Unavailable ($($_.Exception.Message))")
+        }
+
+        # Windows Firewall profiles
+        try {
+            $fwProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+            $disabledFw = @($fwProfiles | Where-Object { -not [bool](Get-SafeProp $_ 'Enabled' $false) })
+            foreach ($fp in $fwProfiles) {
+                $secLines.Add("Windows Firewall ($($fp.Name)): $(if ($fp.Enabled) { 'Enabled' } else { 'DISABLED' })")
+            }
+            if ($disabledFw.Count -gt 0) {
+                $secIssues++
+                $names = ($disabledFw | ForEach-Object { $_.Name }) -join ', '
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='High'; Source='Windows Firewall'
+                    Title="Windows Firewall is DISABLED for profile(s): $names."
+                    Action='Open Windows Security -> Firewall & network protection and enable the firewall (unless managed by a third-party firewall).'
+                })
+            }
+        } catch {
+            $secLines.Add("Windows Firewall: Could not query ($($_.Exception.Message))")
+        }
+
+        # Defender Real-Time Protection
+        try {
+            $mpSt = Get-MpComputerStatus -ErrorAction Stop
+            $rtp = [bool](Get-SafeProp $mpSt 'RealTimeProtectionEnabled' $false)
+            $avOn = [bool](Get-SafeProp $mpSt 'AntivirusEnabled' $false)
+            $tamper = Get-SafeProp $mpSt 'IsTamperProtected' $null
+            $secLines.Add("Microsoft Defender Real-Time Protection: $(if ($rtp) { 'Enabled' } else { 'DISABLED' }) | AntivirusEnabled=$avOn | TamperProtection=$tamper")
+            if (-not $rtp) {
+                $secIssues++
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='High'; Source='Windows Security (Defender)'
+                    Title='Microsoft Defender Real-Time Protection is OFF.'
+                    Action='Check Windows Security -> Virus & threat protection (ignore if you intentionally use a third-party antivirus).'
+                })
+            }
+        } catch {
+            $secLines.Add("Microsoft Defender Status: Could not query ($($_.Exception.Message))")
+        }
+
+        $secDetails = $secLines -join "`r`n"
+        Write-RawLog $secDetails $rawLogPath
+        Write-Host "  Memory Integrity (HVCI): $(if ($hvciOn) { 'ON' } else { 'OFF' }) | Security Alerts: $secIssues"
+
+        $status = if ($secIssues -gt 0) { 'ATTENTION' } else { 'OK' }
+        $summary = if ($secIssues -gt 0) {
+            "Found $secIssues security protection setting(s) turned off (HVCI: $(if ($hvciOn) { 'ON' } else { 'OFF' }))."
+        } else {
+            'Memory Integrity (HVCI), Windows Firewall (all profiles), and Defender Real-Time Protection are all enabled.'
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='security_posture'; Order=5; Name='5. Windows Security & Memory Integrity (HVCI)'; Command='Win32_DeviceGuard + Get-NetFirewallProfile + Get-MpComputerStatus'
+            Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary=$summary; Details=$secDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='security_posture'; Order=5; Name='5. Windows Security & Memory Integrity (HVCI)'; Command='DeviceGuard + Firewall + Defender'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="Security posture check failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 6/15: WMI Repository Verification & Auto-Salvage (winmgmt)
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[6/15] Verifying WMI Repository (winmgmt /verifyrepository)...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [6/15] winmgmt /verifyrepository ---" $rawLogPath
+    try {
+        $winmgmtExe = Join-Path $sysDir 'Wbem\WinMgmt.exe'
+        if (-not (Test-Path -LiteralPath $winmgmtExe)) { $winmgmtExe = 'winmgmt.exe' }
+        $wmiVer = Invoke-ConsoleTool -FilePath $winmgmtExe -Arguments '/verifyrepository'
+        $wmiOut = ($wmiVer.Output + "`r`n" + $wmiVer.Error).Trim()
+        Write-RawLog $wmiOut $rawLogPath
+
+        if ($wmiVer.ExitCode -eq 0 -and $wmiOut -match 'is consistent') {
+            $status = 'OK'
+            $summary = 'WMI repository is consistent and healthy.'
+            $wmiDetails = $wmiOut
+        } else {
+            Write-Host '  WMI repository inconsistency detected. Running winmgmt /salvagerepository...' -ForegroundColor Yellow
+            $wmiSalv = Invoke-ConsoleTool -FilePath $winmgmtExe -Arguments '/salvagerepository'
+            $salvOut = ($wmiSalv.Output + "`r`n" + $wmiSalv.Error).Trim()
+            Write-RawLog $salvOut $rawLogPath
+            $wmiDetails = "Verify:`r`n$wmiOut`r`n`r`nSalvage:`r`n$salvOut"
+
+            if ($wmiSalv.ExitCode -eq 0 -and $salvOut -match 'consistent|salvaged') {
+                $status = 'FIXED'
+                $summary = 'WMI repository was inconsistent and was repaired with /salvagerepository.'
+                $fixedItems.Add([PSCustomObject]@{
+                    Source      = 'WMI Repository (winmgmt)'
+                    Description = 'Detected WMI repository inconsistency and repaired it safely using winmgmt /salvagerepository.'
+                })
+            } else {
+                $status = 'ATTENTION'
+                $summary = "WMI repository salvage exited with code $($wmiSalv.ExitCode)."
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='Medium'; Source='WMI Repository (winmgmt)'
+                    Title='WMI repository reported an inconsistency that /salvagerepository could not fully clear.'
+                    Action='After restarting, re-run "winmgmt /verifyrepository" as Administrator to confirm WMI health.'
+                })
+            }
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='wmi_repo'; Order=6; Name='6. WMI Repository Verification & Repair'; Command='winmgmt /verifyrepository (+ /salvagerepository if inconsistent)'
+            Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary=$summary; Details=$wmiDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='wmi_repo'; Order=6; Name='6. WMI Repository Verification & Repair'; Command='winmgmt /verifyrepository'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="WMI verification failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 7/15: DISM Health Scan (/ScanHealth)
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[7/15] Scanning Windows Image Health (DISM /ScanHealth)...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [7/15] DISM /ScanHealth ---" $rawLogPath
     try {
         $dismScan = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /ScanHealth'
         $scanOut = ($dismScan.Output + "`r`n" + $dismScan.Error).Trim()
@@ -1044,7 +1402,7 @@ function Invoke-WindowsScanAndFix {
             $summary = 'No Windows component store corruption detected.'
         } elseif ($dismRepairable) {
             $status = 'ATTENTION'
-            $summary = 'Component store corruption detected (repairable). Proceeding to RestoreHealth in Step 5.'
+            $summary = 'Component store corruption detected (repairable). Proceeding to RestoreHealth in Step 8.'
         } elseif ($dismUnrepairable) {
             $status = 'ATTENTION'
             $summary = 'DISM reported unrepairable component store corruption.'
@@ -1059,7 +1417,7 @@ function Invoke-WindowsScanAndFix {
         }
 
         $results.Add([PSCustomObject]@{
-            Id='dism_scan'; Order=4; Name='4. DISM Component Store Scan'; Command='DISM /Online /Cleanup-Image /ScanHealth'
+            Id='dism_scan'; Order=7; Name='7. DISM Component Store Scan'; Command='DISM /Online /Cleanup-Image /ScanHealth'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$summary; Details=$scanOut; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1067,36 +1425,46 @@ function Invoke-WindowsScanAndFix {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='dism_scan'; Order=4; Name='4. DISM Component Store Scan'; Command='DISM /Online /Cleanup-Image /ScanHealth'
+            Id='dism_scan'; Order=7; Name='7. DISM Component Store Scan'; Command='DISM /Online /Cleanup-Image /ScanHealth'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="DISM /ScanHealth failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     }
 
     # ------------------------------------------------------------------
-    # STEP 5/9: DISM Image Repair (/RestoreHealth)
+    # STEP 8/15: DISM Image Repair (/RestoreHealth) + /StartComponentCleanup
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[5/9] Repairing Windows Image if needed (DISM /RestoreHealth)...' -ForegroundColor Cyan
+    Write-Host '[8/15] Repairing & Cleaning Windows Image (DISM /RestoreHealth + /StartComponentCleanup)...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [5/9] DISM /RestoreHealth ---" $rawLogPath
+    Write-RawLog "`r`n--- [8/15] DISM /RestoreHealth & /StartComponentCleanup ---" $rawLogPath
     try {
         $dismRestore = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /RestoreHealth'
         $restOut = ($dismRestore.Output + "`r`n" + $dismRestore.Error).Trim()
         Write-RawLog $restOut $rawLogPath
 
+        $cleanupNote = ''
+        $cleanupOut = ''
         if ($dismRestore.ExitCode -in @(0, 3010)) {
+            Write-Host '  Running DISM /StartComponentCleanup to safely remove superseded update bloat...'
+            $dismClean = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /StartComponentCleanup'
+            $cleanupOut = ($dismClean.Output + "`r`n" + $dismClean.Error).Trim()
+            Write-RawLog $cleanupOut $rawLogPath
+            if ($dismClean.ExitCode -in @(0, 3010)) {
+                $cleanupNote = ' Component store cleanup also completed.'
+            }
+
             $rebootNote = if ($dismRestore.ExitCode -eq 3010) { ' (restart required to complete)' } else { '' }
             if ($dismRepairable) {
                 $status = 'FIXED'
-                $summary = "DISM repaired the component store corruption$rebootNote."
+                $summary = "DISM repaired the component store corruption$rebootNote.$cleanupNote"
                 $fixedItems.Add([PSCustomObject]@{
-                    Source      = 'DISM (/RestoreHealth)'
-                    Description = "Repaired Windows component store corruption detected by /ScanHealth$rebootNote."
+                    Source      = 'DISM (/RestoreHealth + /StartComponentCleanup)'
+                    Description = "Repaired Windows component store corruption and cleaned superseded WinSxS packages$rebootNote."
                 })
             } else {
                 $status = 'OK'
-                $summary = "Windows component store verified and healthy$rebootNote."
+                $summary = "Windows component store verified and healthy$rebootNote.$cleanupNote"
             }
         } else {
             $status = 'ATTENTION'
@@ -1108,16 +1476,20 @@ function Invoke-WindowsScanAndFix {
             })
         }
 
+        $combinedDism = if (-not [string]::IsNullOrWhiteSpace($cleanupOut)) {
+            "=== /RestoreHealth ===`r`n$restOut`r`n`r`n=== /StartComponentCleanup ===`r`n$cleanupOut"
+        } else { $restOut }
+
         $results.Add([PSCustomObject]@{
-            Id='dism_restore'; Order=5; Name='5. DISM Component Store Repair'; Command='DISM /Online /Cleanup-Image /RestoreHealth'
+            Id='dism_restore'; Order=8; Name='8. DISM Component Store Repair & Cleanup'; Command='DISM /Online /Cleanup-Image /RestoreHealth + /StartComponentCleanup'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
-            Summary=$summary; Details=$restOut; ExtraLinkPath=''; ExtraLinkLabel=''
+            Summary=$summary; Details=$combinedDism; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     } catch {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='dism_restore'; Order=5; Name='5. DISM Component Store Repair'; Command='DISM /Online /Cleanup-Image /RestoreHealth'
+            Id='dism_restore'; Order=8; Name='8. DISM Component Store Repair & Cleanup'; Command='DISM /Online /Cleanup-Image /RestoreHealth'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="DISM /RestoreHealth failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1129,12 +1501,12 @@ function Invoke-WindowsScanAndFix {
     }
 
     # ------------------------------------------------------------------
-    # STEP 6/9: System File Checker (sfc /scannow)
+    # STEP 9/15: System File Checker (sfc /scannow)
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[6/9] Scanning and repairing Windows system files (sfc /scannow)...' -ForegroundColor Cyan
+    Write-Host '[9/15] Scanning and repairing Windows system files (sfc /scannow)...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [6/9] sfc /scannow ---" $rawLogPath
+    Write-RawLog "`r`n--- [9/15] sfc /scannow ---" $rawLogPath
     try {
         $sfcRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'sfc.exe') -Arguments '/scannow' -Encoding 'Unicode'
         $sfcOut = ($sfcRes.Output + "`r`n" + $sfcRes.Error).Trim()
@@ -1192,7 +1564,7 @@ function Invoke-WindowsScanAndFix {
         }
 
         $results.Add([PSCustomObject]@{
-            Id='sfc'; Order=6; Name='6. System File Checker'; Command='sfc /scannow'
+            Id='sfc'; Order=9; Name='9. System File Checker'; Command='sfc /scannow'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$summary; Details=$sfcDetails; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1200,7 +1572,7 @@ function Invoke-WindowsScanAndFix {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='sfc'; Order=6; Name='6. System File Checker'; Command='sfc /scannow'
+            Id='sfc'; Order=9; Name='9. System File Checker'; Command='sfc /scannow'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="sfc /scannow failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1212,12 +1584,12 @@ function Invoke-WindowsScanAndFix {
     }
 
     # ------------------------------------------------------------------
-    # STEP 7/9: CHKDSK on ALL Connected Drives
+    # STEP 10/15: CHKDSK on ALL Connected Drives
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[7/9] Scanning all connected drives (chkdsk)...' -ForegroundColor Cyan
+    Write-Host '[10/15] Scanning all connected drives (chkdsk)...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [7/9] chkdsk on all connected drives ---" $rawLogPath
+    Write-RawLog "`r`n--- [10/15] chkdsk on all connected drives ---" $rawLogPath
     try {
         $vols = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object {
             $dl = Get-SafeProp $_ 'DriveLetter' $null
@@ -1315,7 +1687,7 @@ function Invoke-WindowsScanAndFix {
         $chkStatus = if ($anyDriveNeedsAttention) { 'ATTENTION' } elseif ($anyDriveFixed) { 'FIXED' } else { 'OK' }
         $chkSummary = "Scanned $($vols.Count) drive(s): " + ($driveSummaries -join ' | ')
         $results.Add([PSCustomObject]@{
-            Id='chkdsk'; Order=7; Name='7. All Connected Drives Scan'; Command='chkdsk <Drive>: /scan (all mounted Fixed/Removable drives)'
+            Id='chkdsk'; Order=10; Name='10. All Connected Drives Scan'; Command='chkdsk <Drive>: /scan (all mounted Fixed/Removable drives)'
             Status=$chkStatus; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$chkSummary; Details=($driveOutputs -join "`r`n`r`n"); ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1323,19 +1695,249 @@ function Invoke-WindowsScanAndFix {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='chkdsk'; Order=7; Name='7. All Connected Drives Scan'; Command='chkdsk <Drive>: /scan'
+            Id='chkdsk'; Order=10; Name='10. All Connected Drives Scan'; Command='chkdsk <Drive>: /scan'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="CHKDSK failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
     }
 
     # ------------------------------------------------------------------
-    # STEP 8/9: Microsoft Defender Full Scan (Start-MpScan -ScanType FullScan)
+    # STEP 11/15: SSD TRIM Optimization & Safe Stale Temp Cleanup
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[8/9] Running Microsoft Defender Full Scan (this can take a while)...' -ForegroundColor Cyan
+    Write-Host '[11/15] Running SSD TRIM Optimization & Safe Stale Temp Cleanup...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [8/9] Start-MpScan -ScanType FullScan ---" $rawLogPath
+    Write-RawLog "`r`n--- [11/15] SSD ReTrim & Stale Temp Cleanup ---" $rawLogPath
+    try {
+        $optLines = New-Object 'System.Collections.Generic.List[string]'
+        $trimmedDrives = New-Object 'System.Collections.Generic.List[string]'
+
+        try {
+            $ssdDiskIds = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { (Get-SafeProp $_ 'MediaType' '') -eq 'SSD' } | ForEach-Object { [int](Get-SafeProp $_ 'DeviceId' -1) })
+            $ssdLetters = @(Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and ($_.DiskNumber -in $ssdDiskIds) } | Select-Object -ExpandProperty DriveLetter -Unique | Sort-Object)
+            foreach ($ltr in $ssdLetters) {
+                try {
+                    Optimize-Volume -DriveLetter $ltr -ReTrim -ErrorAction Stop
+                    $trimmedDrives.Add("${ltr}:")
+                    $optLines.Add("SSD TRIM completed on ${ltr}:")
+                    Write-Host "  SSD TRIM completed on ${ltr}:"
+                } catch {
+                    $optLines.Add("SSD TRIM skipped on ${ltr}: ($($_.Exception.Message))")
+                }
+            }
+            if ($ssdLetters.Count -eq 0) { $optLines.Add('No SSD drive letters detected for ReTrim.') }
+        } catch {
+            $optLines.Add("SSD ReTrim check error: $($_.Exception.Message)")
+        }
+
+        # Clean stale temp files older than 24 hours (never touching active runner or locked files)
+        $tempCut = (Get-Date).AddHours(-24)
+        $bytesFreed = [int64]0
+        $filesRemoved = 0
+        $tempTargets = @($env:TEMP, (Join-Path $env:SystemRoot 'Temp')) | Select-Object -Unique
+        foreach ($tDir in $tempTargets) {
+            if ([string]::IsNullOrWhiteSpace($tDir) -or -not (Test-Path -LiteralPath $tDir)) { continue }
+            $staleFiles = @(Get-ChildItem -LiteralPath $tDir -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+                $_.LastWriteTime -lt $tempCut -and $_.Name -notlike 'Windows_Scan_and_Fix_*'
+            })
+            foreach ($sf in $staleFiles) {
+                try {
+                    $sz = $sf.Length
+                    Remove-Item -LiteralPath $sf.FullName -Force -ErrorAction Stop
+                    $bytesFreed += $sz
+                    $filesRemoved++
+                } catch {
+                    # Skip locked or in-use files
+                }
+            }
+        }
+        $mbFreed = [math]::Round($bytesFreed / 1MB, 1)
+        $optLines.Add("Stale temp files removed (>24h old): $filesRemoved file(s), ${mbFreed} MB reclaimed.")
+        Write-Host "  Stale temp cleanup: removed $filesRemoved file(s), freed ${mbFreed} MB."
+
+        $optDetails = $optLines -join "`r`n"
+        Write-RawLog $optDetails $rawLogPath
+
+        $didWork = ($trimmedDrives.Count -gt 0 -or $mbFreed -ge 10)
+        if ($didWork) {
+            $parts = New-Object 'System.Collections.Generic.List[string]'
+            if ($trimmedDrives.Count -gt 0) { $parts.Add("Ran SSD TRIM on $($trimmedDrives -join ', ')") }
+            if ($mbFreed -ge 10) { $parts.Add("cleaned $filesRemoved stale temp file(s) (${mbFreed} MB freed)") }
+            $fixedItems.Add([PSCustomObject]@{
+                Source      = 'SSD Optimization & Temp Cleanup'
+                Description = ($parts -join ' and ') + '.'
+            })
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='opt_cleanup'; Order=11; Name='11. SSD TRIM & Safe Temp Cleanup'; Command='Optimize-Volume -ReTrim + Stale Temp (>24h) Cleanup'
+            Status=(if ($didWork) { 'FIXED' } else { 'OK' }); Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="SSD TRIM: $(if ($trimmedDrives.Count -gt 0) { $trimmedDrives -join ', ' } else { 'None' }) | Stale Temp Freed: ${mbFreed} MB ($filesRemoved file(s))."
+            Details=$optDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='opt_cleanup'; Order=11; Name='11. SSD TRIM & Safe Temp Cleanup'; Command='Optimize-Volume -ReTrim'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="Optimization/cleanup error: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 12/15: Network Stack, DNS & Clock Sync Repair
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[12/15] Refreshing DNS Cache, Winsock Catalog & System Clock...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [12/15] ipconfig /flushdns + netsh winsock reset + w32tm /resync ---" $rawLogPath
+    try {
+        $netLines = New-Object 'System.Collections.Generic.List[string]'
+        $netOk = $true
+
+        $dnsRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'ipconfig.exe') -Arguments '/flushdns'
+        $netLines.Add("=== ipconfig /flushdns (exit $($dnsRes.ExitCode)) ===`r`n$($dnsRes.Output.Trim())")
+
+        $wsRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'netsh.exe') -Arguments 'winsock reset'
+        $netLines.Add("=== netsh winsock reset (exit $($wsRes.ExitCode)) ===`r`n$($wsRes.Output.Trim())")
+        if ($wsRes.ExitCode -ne 0) { $netOk = $false }
+
+        $timeNote = 'Clock sync skipped'
+        try {
+            $w32Svc = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+            if ($null -ne $w32Svc -and $w32Svc.Status -ne 'Running' -and $w32Svc.StartType -ne 'Disabled') {
+                Start-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+            }
+            $tmRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'w32tm.exe') -Arguments '/resync /nowait'
+            $netLines.Add("=== w32tm /resync /nowait (exit $($tmRes.ExitCode)) ===`r`n$(($tmRes.Output + ' ' + $tmRes.Error).Trim())")
+            $timeNote = if ($tmRes.ExitCode -eq 0) { 'Clock resynced' } else { "Clock resync exit $($tmRes.ExitCode)" }
+        } catch {
+            $netLines.Add("Clock resync error: $($_.Exception.Message)")
+        }
+
+        $netDetails = $netLines -join "`r`n`r`n"
+        Write-RawLog $netDetails $rawLogPath
+
+        if ($dnsRes.ExitCode -eq 0 -or $wsRes.ExitCode -eq 0) {
+            $fixedItems.Add([PSCustomObject]@{
+                Source      = 'Network Stack & Clock Sync'
+                Description = "Flushed DNS cache, reset Winsock catalog (takes effect after restart; Wi-Fi/static IPs preserved), and ran Windows Time sync ($timeNote)."
+            })
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='network_time'; Order=12; Name='12. Network Stack, DNS & Clock Sync'; Command='ipconfig /flushdns + netsh winsock reset + w32tm /resync'
+            Status=(if ($netOk) { 'FIXED' } else { 'ATTENTION' }); Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="DNS cache flushed, Winsock catalog reset (applies on reboot), $timeNote."
+            Details=$netDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='network_time'; Order=12; Name='12. Network Stack, DNS & Clock Sync'; Command='ipconfig /flushdns + netsh winsock reset'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="Network/clock refresh error: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 13/15: Core Windows Services Health & Auto-Recovery
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[13/15] Checking Core Windows Services Health...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [13/15] Core Windows Services ---" $rawLogPath
+    try {
+        $alwaysRun = @('EventLog', 'Dnscache', 'Dhcp', 'mpssvc', 'WinDefend')
+        $updateSvcs = @('wuauserv', 'BITS', 'CryptSvc', 'TrustedInstaller')
+        $svcLines = New-Object 'System.Collections.Generic.List[string]'
+        $restartedSvcs = New-Object 'System.Collections.Generic.List[string]'
+        $svcProblems = New-Object 'System.Collections.Generic.List[string]'
+
+        foreach ($sName in $alwaysRun) {
+            $svc = Get-Service -Name $sName -ErrorAction SilentlyContinue
+            if ($null -eq $svc) { continue }
+            $stType = [string]$svc.StartType
+            if ($svc.Status -eq 'Running') {
+                $svcLines.Add("  [OK]       $sName ($($svc.DisplayName)) - Running ($stType)")
+            } elseif ($stType -eq 'Disabled') {
+                $svcLines.Add("  [DISABLED] $sName ($($svc.DisplayName)) - Disabled")
+                if ($sName -ne 'WinDefend') { $svcProblems.Add("$sName is Disabled") }
+            } else {
+                try {
+                    Start-Service -Name $sName -ErrorAction Stop
+                    $restartedSvcs.Add($sName)
+                    $svcLines.Add("  [FIXED]    $sName ($($svc.DisplayName)) - Was stopped; started successfully")
+                } catch {
+                    $svcProblems.Add("$sName stopped and failed to start ($($_.Exception.Message))")
+                    $svcLines.Add("  [ERROR]    $sName ($($svc.DisplayName)) - Failed to start: $($_.Exception.Message)")
+                }
+            }
+        }
+
+        foreach ($sName in $updateSvcs) {
+            $svc = Get-Service -Name $sName -ErrorAction SilentlyContinue
+            if ($null -eq $svc) { continue }
+            $stType = [string]$svc.StartType
+            if ($stType -eq 'Disabled') {
+                $svcProblems.Add("$sName (Windows Update component) is Disabled")
+                $svcLines.Add("  [WARN]     $sName ($($svc.DisplayName)) - Disabled")
+            } else {
+                $svcLines.Add("  [OK]       $sName ($($svc.DisplayName)) - $($svc.Status) ($stType)")
+            }
+        }
+
+        $svcDetails = $svcLines -join "`r`n"
+        Write-RawLog $svcDetails $rawLogPath
+        Write-Host "  Services restarted: $($restartedSvcs.Count) | Service issues: $($svcProblems.Count)"
+
+        if ($restartedSvcs.Count -gt 0) {
+            $fixedItems.Add([PSCustomObject]@{
+                Source      = 'Core Windows Services'
+                Description = "Automatically started stopped core service(s): $($restartedSvcs -join ', ')."
+            })
+        }
+        if ($svcProblems.Count -gt 0) {
+            $attentionItems.Add([PSCustomObject]@{
+                Severity='Medium'; Source='Core Windows Services'
+                Title="$($svcProblems.Count) core Windows service issue(s) found."
+                Action="Review Services (services.msc): $($svcProblems -join '; ')."
+            })
+        }
+
+        $svcStatus = if ($svcProblems.Count -gt 0) { 'ATTENTION' } elseif ($restartedSvcs.Count -gt 0) { 'FIXED' } else { 'OK' }
+        $svcSummary = if ($svcProblems.Count -gt 0) {
+            "Found $($svcProblems.Count) service issue(s); restarted $($restartedSvcs.Count) service(s)."
+        } elseif ($restartedSvcs.Count -gt 0) {
+            "Recovered $($restartedSvcs.Count) stopped core Windows service(s): $($restartedSvcs -join ', ')."
+        } else {
+            'All core networking, logging, firewall, and Windows Update services are healthy.'
+        }
+
+        $results.Add([PSCustomObject]@{
+            Id='core_services'; Order=13; Name='13. Core Windows Services Health'; Command='Get-Service / Start-Service (EventLog, Dnscache, Dhcp, mpssvc, WinDefend, wuauserv, BITS, CryptSvc)'
+            Status=$svcStatus; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary=$svcSummary; Details=$svcDetails; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    } catch {
+        $errMsg = $_.Exception.Message
+        Write-RawLog "ERROR: $errMsg" $rawLogPath
+        $results.Add([PSCustomObject]@{
+            Id='core_services'; Order=13; Name='13. Core Windows Services Health'; Command='Get-Service'
+            Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
+            Summary="Core services check failed: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
+        })
+    }
+
+    # ------------------------------------------------------------------
+    # STEP 14/15: Microsoft Defender Full Scan (Start-MpScan -ScanType FullScan)
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '[14/15] Running Microsoft Defender Full Scan (this can take a while)...' -ForegroundColor Cyan
+    $stepStart = Get-Date
+    Write-RawLog "`r`n--- [14/15] Start-MpScan -ScanType FullScan ---" $rawLogPath
     try {
         $mpStart = Get-Date
         try {
@@ -1388,7 +1990,7 @@ function Invoke-WindowsScanAndFix {
         $mpDetails = $mpDetailLines -join "`r`n"
         Write-RawLog $mpDetails $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='defender'; Order=8; Name='8. Microsoft Defender Full Scan'; Command='Start-MpScan -ScanType FullScan'
+            Id='defender'; Order=14; Name='14. Microsoft Defender Full Scan'; Command='Start-MpScan -ScanType FullScan'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$summary; Details=$mpDetails; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1397,7 +1999,7 @@ function Invoke-WindowsScanAndFix {
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $mpHelp = 'Ensure Microsoft Defender service is enabled, or check your third-party antivirus if Defender is intentionally disabled.'
         $results.Add([PSCustomObject]@{
-            Id='defender'; Order=8; Name='8. Microsoft Defender Full Scan'; Command='Start-MpScan -ScanType FullScan'
+            Id='defender'; Order=14; Name='14. Microsoft Defender Full Scan'; Command='Start-MpScan -ScanType FullScan'
             Status='ATTENTION'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="Microsoft Defender Full Scan did not complete: $errMsg"; Details="$errMsg`r`n$mpHelp"
             ExtraLinkPath=''; ExtraLinkLabel=''
@@ -1410,12 +2012,12 @@ function Invoke-WindowsScanAndFix {
     }
 
     # ------------------------------------------------------------------
-    # STEP 9/9: Windows Memory Diagnostic (mdsched / bcdedit {memdiag})
+    # STEP 15/15: Windows Memory Diagnostic (mdsched / bcdedit {memdiag})
     # ------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[9/9] Scheduling Windows Memory Diagnostic for restart (mdsched / {memdiag})...' -ForegroundColor Cyan
+    Write-Host '[15/15] Scheduling Windows Memory Diagnostic for restart (mdsched / {memdiag})...' -ForegroundColor Cyan
     $stepStart = Get-Date
-    Write-RawLog "`r`n--- [9/9] Windows Memory Diagnostic ({memdiag}) ---" $rawLogPath
+    Write-RawLog "`r`n--- [15/15] Windows Memory Diagnostic ({memdiag}) ---" $rawLogPath
     try {
         $bcdEnum = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'bcdedit.exe') -Arguments '/enum {memdiag}'
         $bcdOut = ($bcdEnum.Output + "`r`n" + $bcdEnum.Error).Trim()
@@ -1453,7 +2055,7 @@ function Invoke-WindowsScanAndFix {
         }
 
         $results.Add([PSCustomObject]@{
-            Id='memdiag'; Order=9; Name='9. Windows Memory Diagnostic (RAM Test)'; Command='mdsched.exe (bcdedit /bootsequence {memdiag})'
+            Id='memdiag'; Order=15; Name='15. Windows Memory Diagnostic (RAM Test)'; Command='mdsched.exe (bcdedit /bootsequence {memdiag})'
             Status=$status; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary=$summary; Details=$details; ExtraLinkPath=''; ExtraLinkLabel=''
         })
@@ -1461,7 +2063,7 @@ function Invoke-WindowsScanAndFix {
         $errMsg = $_.Exception.Message
         Write-RawLog "ERROR: $errMsg" $rawLogPath
         $results.Add([PSCustomObject]@{
-            Id='memdiag'; Order=9; Name='9. Windows Memory Diagnostic (RAM Test)'; Command='mdsched.exe'
+            Id='memdiag'; Order=15; Name='15. Windows Memory Diagnostic (RAM Test)'; Command='mdsched.exe'
             Status='ERROR'; Duration=(Format-DurationSpan ((Get-Date)-$stepStart))
             Summary="Failed to queue Memory Diagnostic: $errMsg"; Details=$errMsg; ExtraLinkPath=''; ExtraLinkLabel=''
         })
