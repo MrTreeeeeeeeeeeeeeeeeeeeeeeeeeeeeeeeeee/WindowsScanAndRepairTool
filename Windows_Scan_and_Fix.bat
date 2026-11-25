@@ -666,6 +666,10 @@ function New-ScanUiState {
         RawLogPath     = $RawLogPath
         SpinIdx        = 0
         TotalEnabled   = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
+        HeaderRow      = -1
+        HeaderPrefix   = ''
+        StatusRow      = -1
+        LastHeaderSec  = ''
     }
 }
 
@@ -689,13 +693,18 @@ function Render-ScanDashboard {
     $filled = [int][math]::Round(($pct / 100.0) * $barLen)
     $progBar = ('#' * $filled) + ('-' * ($barLen - $filled))
     $elapsedStr = Format-ClockSpan ((Get-Date) - $UiState.ScanStart)
+    $headerPrefix = ("  WINDOWS SCAN & FIX   [$progBar] {0,3}%  ($doneCount/$totalEn)   Elapsed: " -f $pct)
 
     if (-not $NoClear) {
+        try { [Console]::CursorVisible = (-not (-not $Final)) } catch {}
         try { Clear-Host } catch {}
     }
 
     Write-Host $bar -ForegroundColor DarkCyan
-    Write-Host ("  WINDOWS SCAN & FIX   [$progBar] {0,3}%  ($doneCount/$totalEn)   Elapsed: $elapsedStr" -f $pct) -ForegroundColor Cyan
+    try { $UiState.HeaderRow = [Console]::CursorTop } catch { $UiState.HeaderRow = -1 }
+    $UiState.HeaderPrefix = $headerPrefix
+    $UiState.LastHeaderSec = $elapsedStr
+    Write-Host (($headerPrefix + $elapsedStr).PadRight($w)) -ForegroundColor Cyan
     Write-Host ("  PC: $env:COMPUTERNAME  |  Fixed: $($UiState.FixedCount)  |  Alerts: $($UiState.AttentionCount)  |  Raw Log Saved Silently") -ForegroundColor Gray
     Write-Host $bar -ForegroundColor DarkCyan
     Write-Host ''
@@ -734,7 +743,11 @@ function Render-ScanDashboard {
     if (-not $Final) {
         $actTxt = '  ' + (Truncate-Text ("ACTIVE: [$($UiState.ActiveOrder)/15] $($UiState.ActiveCommand)") ($w - 2))
         Write-Host $actTxt -ForegroundColor Cyan
+        try { $UiState.StatusRow = [Console]::CursorTop } catch { $UiState.StatusRow = -1 }
         Write-Host '  STATUS: [|] Starting...' -ForegroundColor Gray -NoNewline
+    } else {
+        $UiState.StatusRow = -1
+        try { [Console]::CursorVisible = $true } catch {}
     }
 }
 
@@ -752,11 +765,32 @@ function Update-ActiveStatusLine {
     $totalClock = Format-ClockSpan ((Get-Date) - $UiState.ScanStart)
     $w = Get-ConsoleSafeWidth
 
+    # Keep top header Elapsed timer ticking live every second
+    if ($totalClock -ne $UiState.LastHeaderSec -and $UiState.HeaderRow -ge 0 -and -not [string]::IsNullOrEmpty($UiState.HeaderPrefix)) {
+        $UiState.LastHeaderSec = $totalClock
+        try {
+            $oldFg = [Console]::ForegroundColor
+            [Console]::SetCursorPosition(0, $UiState.HeaderRow)
+            [Console]::ForegroundColor = [ConsoleColor]::Cyan
+            $hdrFull = $UiState.HeaderPrefix + $totalClock
+            if ($hdrFull.Length -gt $w) { $hdrFull = $hdrFull.Substring(0, $w) }
+            [Console]::Write($hdrFull.PadRight($w))
+            [Console]::ForegroundColor = $oldFg
+        } catch {
+            # Ignore non-interactive cursor errors
+        }
+    }
+
     $detail = if ([string]::IsNullOrWhiteSpace($Hint)) { 'Working... (raw output captured to log)' } else { $Hint }
     $line = '  ' + (Truncate-Text "STATUS: [$spin] Step $stepClock | Total $totalClock | $detail" ($w - 2))
     $padded = $line.PadRight($w)
     try {
-        [Console]::Write("`r" + $padded)
+        if ($UiState.StatusRow -ge 0) {
+            [Console]::SetCursorPosition(0, $UiState.StatusRow)
+            [Console]::Write($padded)
+        } else {
+            [Console]::Write("`r" + $padded)
+        }
     } catch {
         # Ignore non-interactive console write errors
     }
@@ -1586,10 +1620,11 @@ function Invoke-WindowsScanAndFix {
             }
 
             $dur = Format-DurationSpan ((Get-Date) - $stepStart)
+            $energyLink = if (Test-Path -LiteralPath $energyHtmlPath) { $energyHtmlPath } else { '' }
             $results.Add([PSCustomObject]@{
                 Id='power_energy'; Order=2; Name='2. Power, Energy & Battery Diagnostics'; Command="powercfg /energy /output `"$energyHtmlPath`" (+ /batteryreport if laptop)"
                 Status=$status; Duration=$dur; Summary=$summary; Details=($detailsList -join "`r`n")
-                ExtraLinkPath=(if (Test-Path -LiteralPath $energyHtmlPath) { $energyHtmlPath } else { '' })
+                ExtraLinkPath=$energyLink
                 ExtraLinkLabel='Open energy-report.html'
             })
             Set-StepDone 2 $status $dur $summary
@@ -2597,7 +2632,7 @@ function Invoke-WindowsScanAndFix {
             [void]$psRun.AddScript({
                 param($Mode)
                 $ProgressPreference = 'SilentlyContinue'
-                try { Update-MpSignature -ErrorAction SilentlyContinue } catch {}
+                try { Update-MpSignature -ErrorAction Ignore } catch {}
                 Start-MpScan -ScanType $Mode -ErrorAction Stop
             }).AddArgument($defMode)
 
