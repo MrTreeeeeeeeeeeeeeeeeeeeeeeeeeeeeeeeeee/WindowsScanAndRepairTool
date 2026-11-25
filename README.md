@@ -1,20 +1,23 @@
 # Windows Scan & Fix Tool
 
-A single, double-clickable script (`Windows_Scan_and_Fix.bat`) that runs built-in Windows health checks and repairs, restarts your computer to run a RAM test, and automatically opens a plain-English HTML report when you sign back in.
+A single, double-clickable CLI app (`Windows_Scan_and_Fix.bat`) with an interactive pre-run options menu and live progress dashboard. It runs built-in Windows health checks and repairs, optionally restarts your computer to run a RAM test, and opens a plain-English HTML report showing what was fixed and anything that needs your attention.
 
 ## How to Use
 
 1. **Save any open work** before starting.
 2. Double-click **`Windows_Scan_and_Fix.bat`**.
 3. Click **Yes** on the Administrator (UAC) prompt.
-4. Let it run — it starts after a 5-second countdown. Because it includes a **Microsoft Defender Full Scan**, expect **30 minutes to 2+ hours** depending on your drives.
-5. When finished, it counts down **30 seconds** and **restarts automatically** to run the Windows Memory Diagnostic.
-6. After you sign back into Windows, your finished **HTML report opens automatically** in your browser showing:
-   - **What Was Fixed**
-   - **Things You May Need to Look At**
-   - **Detailed Results** for all 15 checks
-
-> **Need to cancel?** Close the window or press `Ctrl+C` during the 5-second start countdown or the 30-second countdown before restart.
+4. In the **interactive settings list**, use your **Up/Down arrow keys** to move through the checks and options, and press **Space** or **Enter** to check/uncheck items (or just press **Enter** on **`[ START SCAN ]`** to run with the default Full Scan preset):
+   - **`Up / Down`** — Move through all 15 checks, **Restart PC When Done**, and **Open HTML Report Automatically**
+   - **`Space / Enter`** — Toggle `[x]` / `[ ]` (on Microsoft Defender, cycles `FullScan` / `QuickScan` / `Off`; `Left / Right` arrows also cycle it)
+   - **`S`** (or **`Enter`** on **`[ START SCAN ]`**) — Start the scan
+   - **`F`** — Full Scan preset (all 15 checks, Defender Full Scan, Memory Test, auto-restart)
+   - **`Q`** — Quick Tune-Up preset (~10–15 min, Defender Quick Scan, skips 60s energy trace & reboot)
+   - **`A` / `N`** — Select All / Deselect All (**`Esc`** to exit)
+5. Watch progress in the **live CLI dashboard** (overall progress bar, color-coded step statuses, spinner, elapsed timer, and live percentages — raw tool output is captured silently to `raw_scan_log.txt`).
+6. When finished:
+   - If **Restart = Yes**: counts down **30 seconds** (close the window or press `Ctrl+C` to cancel), restarts to run the Windows Memory Diagnostic, and automatically opens the updated HTML report once you sign back in.
+   - If **Restart = No**: opens the HTML report right away without restarting.
 
 ## What It Checks & Fixes (15 Steps)
 
@@ -31,17 +34,17 @@ A single, double-clickable script (`Windows_Scan_and_Fix.bat`) that runs built-i
 11. **SSD TRIM & Safe Temp Cleanup** — Runs TRIM optimization on SSDs (`Optimize-Volume -ReTrim`) and removes temporary files older than 24 hours.
 12. **Network, DNS & Clock Sync** — Flushes DNS (`ipconfig /flushdns`), resets Winsock (`netsh winsock reset` — preserves Wi-Fi passwords and static IPs), and syncs system time (`w32tm /resync`).
 13. **Core Windows Services** — Automatically starts stopped core services (Event Log, DNS, DHCP, Firewall, Defender) and checks Windows Update service health.
-14. **Microsoft Defender Full Scan** — Updates virus definitions and runs a full antivirus scan (`Start-MpScan -ScanType FullScan`).
+14. **Microsoft Defender Scan** — Updates virus definitions and runs a Full or Quick antivirus scan (`Start-MpScan`).
 15. **Windows Memory Diagnostic** — Queues a one-time RAM test on restart (`mdsched.exe` / `{memdiag}`) and adds the result to your report after reboot.
 
 ## Where Reports Are Saved
 
 - **Desktop:** `Windows_Scan_Report_<timestamp>.html`
 - **Archive folder (next to the script):** `Reports\Run_<timestamp>\`
-  - `Windows_Scan_Report.html` — Full interactive report
+  - `Windows_Scan_Report.html` — Full interactive report (*What Was Fixed*, *Things You May Need to Look At*, and expandable details)
   - `energy-report.html` — Detailed `powercfg /energy` output
   - `battery-report.html` — Laptop battery report (when a battery is detected)
-  - `raw_scan_log.txt` — Full raw console output from every step
+  - `raw_scan_log.txt` — Full raw console output captured silently from every step
 
 ## Requirements
 
