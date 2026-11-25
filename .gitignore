@@ -1,0 +1,8 @@
+# Generated scan reports and logs
+Reports/
+Logs/
+Windows_Scan_Report*.html
+energy-report.html
+battery-report.html
+raw_scan_log.txt
+*.log
