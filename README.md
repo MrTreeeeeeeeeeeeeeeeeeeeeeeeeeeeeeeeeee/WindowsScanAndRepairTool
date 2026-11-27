@@ -7,19 +7,26 @@
 1. Save any open work before you begin.
 2. Double-click `Windows_Scan_and_Fix.bat`.
 3. Click **Yes** when Windows asks for administrator permission.
-4. Choose a preset or customize the checks in the menu:
-   - Press `Enter` on `[ START SCAN ]` (or press `S`) to run the default **Full Scan**.
-   - Press `Q`, then `S` for a **Quick Tune-Up** if you do not want your PC to restart.
-5. Wait for the scan to finish. A progress bar, elapsed timer, and per-step status update on screen while raw command output is saved silently to `raw_scan_log.txt`.
+4. Choose a preset or customize checks in the interactive menu:
+   - Press `Enter` on **Start scan** (or press `S`) to run the default **Full Scan**.
+   - Open **Preset** (or press `Q`, then `S`) for a **Quick Tune-Up** if you do not want your PC to restart.
+   - Use `Left / Right` to switch between **General**, **Hardware**, **System Repair**, **Maintenance**, and **Restart**, or press `/` to search across all checks and settings.
+5. Wait for the scan to finish. A live monochrome progress dashboard tracks each check while raw command output is saved silently to `raw_scan_log.txt`.
 
 ### What happens when it finishes
 
-- **If "Restart PC When Done" is on:** A 30-second countdown starts so you have time to cancel (close the window or press `Ctrl+C`). Your PC then restarts to run the Windows Memory Diagnostic and opens the updated report automatically once you sign back in.
-- **If "Restart PC When Done" is off:** The report opens right away with no restart.
+- **If "Auto-restart" is on:** A countdown starts (30 seconds by default, configurable to 15s / 30s / 60s under **Restart**) where you can press `Esc` to cancel or `Enter` to restart immediately. Your PC then restarts to run the Windows Memory Diagnostic and opens the updated report automatically once you sign back in.
+- **If "Auto-restart" is off:** The report opens right away with no restart.
 
 ## Presets and menu controls
 
-The pre-run menu lets you toggle any of the 15 checks, choose whether to restart when done, and choose whether to open the report automatically.
+Every setting lives in one tab with no duplicates:
+
+- **General:** Start scan, Preset (`Full Scan` / `Quick Tune-Up`), Open report, Text size (`+` / `-` zoom), Exit
+- **Hardware:** Checks 1–4 (Disks, Power/Battery, Reliability/Crashes, Drivers)
+- **System Repair:** Checks 5–10 (Security/HVCI, WMI, DISM Scan, DISM Repair, SFC, CHKDSK)
+- **Maintenance:** Checks 11–14 (SSD TRIM/Temp, Network/Clock, Core Services, Microsoft Defender Scan)
+- **Restart:** Auto-restart, Restart countdown (`15s` / `30s` / `60s`), Check 15 (Windows Memory Diagnostic)
 
 ### Presets
 
@@ -30,13 +37,16 @@ The pre-run menu lets you toggle any of the 15 checks, choose whether to restart
 
 | Key | Action |
 |---|---|
-| `Up / Down` | Move through the 15 checks and bottom options |
-| `Space / Enter` | Turn a check or option on (`[x]`) or off (`[ ]`); on Microsoft Defender, cycles `FullScan` / `QuickScan` / `Off` |
-| `Left / Right` | Cycle Microsoft Defender mode when highlighted |
-| `S` (or `Enter` on `[ START SCAN ]`) | Start the scan |
-| `F` / `Q` | Switch to Full Scan or Quick Tune-Up |
+| `Left / Right` (or `Tab`) | Switch menu tabs (`General`, `Hardware`, `System Repair`, `Maintenance`, `Restart`) |
+| `Up / Down` | Move selection through rows |
+| `/` | Live search across all checks and settings (includes `[x] Enable all checks`) |
+| `Enter` | Open a sub-view, select an option, toggle a check, or start the scan |
+| `Space` | Quick-toggle checkboxes or cycle picker values in place |
+| `+` / `-` | Increase or decrease console text size |
+| `S` | Start the scan immediately from any tab |
+| `F` / `Q` | Apply Full Scan or Quick Tune-Up preset |
 | `A` / `N` | Select all or deselect all checks |
-| `Esc` | Exit without making changes |
+| `Esc` | Clear search, go back from a sub-view, or close the app |
 
 ## What it checks and fixes
 

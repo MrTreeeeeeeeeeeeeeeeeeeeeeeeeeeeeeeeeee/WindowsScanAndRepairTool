@@ -22,7 +22,7 @@ if /i "%~1"=="--elevated" (
 )
 echo Requesting Administrator privileges...
 set "_SELF=%~f0"
-"%_PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath $env:_SELF -ArgumentList '--elevated' -Verb RunAs -ErrorAction Stop } catch { exit 1 }"
+"%_PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "try { $q = [char]34; $ch = Join-Path $env:SystemRoot 'System32\conhost.exe'; if (Test-Path -LiteralPath $ch) { Start-Process -FilePath $ch -ArgumentList ($q + $env:_SELF + $q + ' --elevated') -Verb RunAs -ErrorAction Stop } else { Start-Process -FilePath $env:_SELF -ArgumentList '--elevated' -Verb RunAs -ErrorAction Stop } } catch { exit 1 }"
 if errorlevel 1 (
     echo.
     echo [CANCELLED] Administrator access was declined or could not be started.
@@ -33,11 +33,12 @@ if errorlevel 1 (
 exit /b 0
 
 :run_engine
+chcp 65001 >nul 2>&1
 set "_SELF=%~f0"
 set "_SCRIPT_DIR=%~dp0"
 set "_PS_TMP=%TEMP%\Windows_Scan_and_Fix_%RANDOM%_%RANDOM%.ps1"
 
-"%_PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "$raw = [System.IO.File]::ReadAllText($env:_SELF, [System.Text.Encoding]::UTF8); $m = '#__' + 'PS_ENGINE_START__'; $i = $raw.LastIndexOf($m); if ($i -lt 0) { throw 'Embedded PowerShell engine not found.' }; $ps = $raw.Substring($i + $m.Length); [System.IO.File]::WriteAllText($env:_PS_TMP, $ps, (New-Object System.Text.UTF8Encoding($false)))"
+"%_PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command "$raw = [System.IO.File]::ReadAllText($env:_SELF, [System.Text.Encoding]::UTF8); $m = '#__' + 'PS_ENGINE_START__'; $i = $raw.LastIndexOf($m); if ($i -lt 0) { throw 'Embedded PowerShell engine not found.' }; $ps = $raw.Substring($i + $m.Length); [System.IO.File]::WriteAllText($env:_PS_TMP, $ps, (New-Object System.Text.UTF8Encoding($true)))"
 if errorlevel 1 (
     echo.
     echo [ERROR] Failed to initialize the diagnostic engine.
@@ -114,15 +115,332 @@ function Format-ClockSpan {
     return ('{0:00}:{1:00}' -f [int][math]::Floor($Span.TotalMinutes), $Span.Seconds)
 }
 
+$script:TuiCaps = $null
+
+function Initialize-TuiConsole {
+    if ($null -ne $script:TuiCaps -and $script:TuiCaps.Initialized) {
+        return $script:TuiCaps
+    }
+
+    $caps = [PSCustomObject]@{
+        Initialized     = $true
+        UseVt           = $false
+        UseUnicode      = $false
+        IsWt            = (-not [string]::IsNullOrEmpty($env:WT_SESSION))
+        CanResizeFont   = $false
+        FontSizePx      = 24
+        OrigFontFace    = ''
+        OrigFontSizeY   = 0
+        OrigFontWeight  = 400
+        OrigBg          = $null
+        OrigFg          = $null
+        OrigEnc         = $null
+    }
+
+    $isRedirected = $false
+    try {
+        if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { $isRedirected = $true }
+    } catch {
+        $isRedirected = $true
+    }
+
+    if (-not $isRedirected) {
+        try {
+            $caps.OrigBg = [Console]::BackgroundColor
+            $caps.OrigFg = [Console]::ForegroundColor
+            $caps.OrigEnc = [Console]::OutputEncoding
+        } catch {}
+
+        try {
+            [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+            $caps.UseUnicode = $true
+        } catch {}
+
+        try {
+            if (-not ('TuiVtConsole' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class TuiVtConsole {
+    private const int STD_OUTPUT_HANDLE = -11;
+    private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct COORD {
+        public short X;
+        public short Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CONSOLE_FONT_INFOEX {
+        public uint cbSize;
+        public uint nFont;
+        public COORD dwFontSize;
+        public uint FontFamily;
+        public uint FontWeight;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string FaceName;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool GetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool SetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern COORD GetLargestConsoleWindowSize(IntPtr hConsoleOutput);
+
+    public static bool EnableVirtualTerminal() {
+        IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+        uint mode;
+        if (!GetConsoleMode(handle, out mode)) return false;
+        if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) return true;
+        return SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+
+    public static bool TryGetFont(out string face, out int height, out int weight) {
+        face = "";
+        height = 0;
+        weight = 400;
+        IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+        CONSOLE_FONT_INFOEX info = new CONSOLE_FONT_INFOEX();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(CONSOLE_FONT_INFOEX));
+        if (!GetCurrentConsoleFontEx(handle, false, ref info)) return false;
+        face = info.FaceName ?? "";
+        height = info.dwFontSize.Y;
+        weight = (int)info.FontWeight;
+        return true;
+    }
+
+    public static bool TrySetFont(string face, int height, int weight) {
+        IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+        CONSOLE_FONT_INFOEX info = new CONSOLE_FONT_INFOEX();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(CONSOLE_FONT_INFOEX));
+        info.FontFamily = 54;
+        info.FontWeight = (uint)weight;
+        info.dwFontSize.X = 0;
+        info.dwFontSize.Y = (short)height;
+        info.FaceName = face;
+        return SetCurrentConsoleFontEx(handle, false, ref info);
+    }
+
+    public static int[] GetLargestWindowSize() {
+        IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return new int[] { 0, 0 };
+        COORD c = GetLargestConsoleWindowSize(handle);
+        return new int[] { c.X, c.Y };
+    }
+}
+'@
+            }
+            $caps.UseVt = [TuiVtConsole]::EnableVirtualTerminal()
+
+            if (-not $caps.IsWt) {
+                $fFace = ''
+                $fH = 0
+                $fW = 400
+                if ([TuiVtConsole]::TryGetFont([ref]$fFace, [ref]$fH, [ref]$fW)) {
+                    $caps.CanResizeFont = $true
+                    $caps.OrigFontFace = $fFace
+                    $caps.OrigFontSizeY = $fH
+                    $caps.OrigFontWeight = $fW
+                }
+            }
+        } catch {
+            $caps.UseVt = $false
+        }
+
+        try {
+            [Console]::BackgroundColor = [ConsoleColor]::Black
+            [Console]::ForegroundColor = [ConsoleColor]::Gray
+        } catch {}
+    }
+
+    $script:TuiCaps = $caps
+
+    if ($caps.CanResizeFont) {
+        $chosen = 24
+        foreach ($candidate in @(26, 24, 22, 20)) {
+            if ([TuiVtConsole]::TrySetFont('Consolas', $candidate, 400)) {
+                $largest = [TuiVtConsole]::GetLargestWindowSize()
+                if ($largest[0] -ge 96 -and $largest[1] -ge 24) {
+                    $chosen = $candidate
+                    break
+                }
+            }
+        }
+        [void](Set-TuiFontSize -HeightPx $chosen)
+    }
+
+    return $caps
+}
+
+function Set-TuiFontSize {
+    param(
+        [Parameter(Mandatory = $true)][int]$HeightPx
+    )
+
+    if ($null -eq $script:TuiCaps -or -not $script:TuiCaps.CanResizeFont) { return $false }
+    $clamped = [math]::Max(16, [math]::Min(36, $HeightPx))
+    $ok = $false
+    try {
+        $ok = [TuiVtConsole]::TrySetFont('Consolas', $clamped, 400)
+        if ($ok) {
+            $script:TuiCaps.FontSizePx = $clamped
+            $largest = [TuiVtConsole]::GetLargestWindowSize()
+            if ($largest[0] -ge 60 -and $largest[1] -ge 16) {
+                $targetW = [math]::Max(76, [math]::Min(108, $largest[0] - 2))
+                $targetH = [math]::Max(20, [math]::Min(28, $largest[1] - 2))
+                if ($targetW -gt $largest[0]) { $targetW = $largest[0] }
+                if ($targetH -gt $largest[1]) { $targetH = $largest[1] }
+                try {
+                    if ([Console]::WindowWidth -gt $targetW -or [Console]::WindowHeight -gt $targetH) {
+                        [Console]::SetWindowSize([math]::Min([Console]::WindowWidth, $targetW), [math]::Min([Console]::WindowHeight, $targetH))
+                    }
+                    [Console]::SetBufferSize($targetW, $targetH)
+                    [Console]::SetWindowSize($targetW, $targetH)
+                } catch {}
+            }
+        }
+    } catch {
+        $ok = $false
+    }
+    return $ok
+}
+
+function Reset-TuiConsole {
+    if ($null -eq $script:TuiCaps) { return }
+    try {
+        if ($script:TuiCaps.UseVt) {
+            $e = [char]0x1B
+            [Console]::Write("${e}[0m")
+        }
+    } catch {}
+    try { [Console]::CursorVisible = $true } catch {}
+    try {
+        if ($script:TuiCaps.CanResizeFont -and $script:TuiCaps.OrigFontSizeY -gt 0 -and -not [string]::IsNullOrWhiteSpace($script:TuiCaps.OrigFontFace)) {
+            [void][TuiVtConsole]::TrySetFont($script:TuiCaps.OrigFontFace, $script:TuiCaps.OrigFontSizeY, $script:TuiCaps.OrigFontWeight)
+        }
+    } catch {}
+    try {
+        if ($null -ne $script:TuiCaps.OrigBg) { [Console]::BackgroundColor = $script:TuiCaps.OrigBg }
+        if ($null -ne $script:TuiCaps.OrigFg) { [Console]::ForegroundColor = $script:TuiCaps.OrigFg }
+    } catch {}
+}
+
+function Get-TuiGlyphs {
+    $useUni = ($null -ne $script:TuiCaps -and $script:TuiCaps.UseUnicode)
+    if ($useUni) {
+        $isWt = ($null -ne $script:TuiCaps -and $script:TuiCaps.IsWt)
+        $spinner = if ($isWt) {
+            @(
+                [string][char]0x280B, [string][char]0x2819, [string][char]0x2839, [string][char]0x2838,
+                [string][char]0x283C, [string][char]0x2834, [string][char]0x2826, [string][char]0x2827,
+                [string][char]0x2807, [string][char]0x280F
+            )
+        } else {
+            @('|', '/', '-', '\')
+        }
+        $checkGlyph = if ($isWt) { [string][char]0x2713 } else { [string][char]0x221A }
+        return [PSCustomObject]@{
+            Chevron  = [string][char]0x203A
+            Dot      = [string][char]0x00B7
+            Rule     = [string][char]0x2500
+            BarFill  = [string][char]0x2501
+            BarTrack = [string][char]0x2500
+            Check    = $checkGlyph
+            Fixed    = '+'
+            Warn     = '!'
+            Err      = [string][char]0x00D7
+            Pending  = [string][char]0x25CB
+            Queued   = [string][char]0x00B7
+            Skipped  = [string][char]0x2013
+            ArrowUp  = [string][char]0x2191
+            ArrowDn  = [string][char]0x2193
+            Spinner  = $spinner
+        }
+    }
+    return [PSCustomObject]@{
+        Chevron  = '>'
+        Dot      = '*'
+        Rule     = '-'
+        BarFill  = '#'
+        BarTrack = '-'
+        Check    = 'v'
+        Fixed    = '+'
+        Warn     = '!'
+        Err      = 'x'
+        Pending  = 'o'
+        Queued   = '.'
+        Skipped  = '-'
+        ArrowUp  = '^'
+        ArrowDn  = 'v'
+        Spinner  = @('|', '/', '-', '\')
+    }
+}
+
+function Get-TuiAnsi {
+    $e = [char]0x1B
+    return [PSCustomObject]@{
+        Reset      = "${e}[0m"
+        Home       = "${e}[H"
+        ClearAll   = "${e}[48;2;12;12;12m${e}[2J${e}[H"
+        ClearBelow = "${e}[48;2;12;12;12m${e}[J"
+        ClearLine  = "${e}[K"
+        BgDark     = "${e}[48;2;12;12;12m"
+        FgBright   = "${e}[38;2;242;242;242;48;2;12;12;12m"
+        FgText     = "${e}[38;2;216;216;216;48;2;12;12;12m"
+        FgMuted    = "${e}[38;2;124;124;124;48;2;12;12;12m"
+        FgDim      = "${e}[38;2;84;84;84;48;2;12;12;12m"
+        TabActive  = "${e}[4;38;2;255;255;255;48;2;12;12;12m"
+        TabIdle    = "${e}[38;2;128;128;128;48;2;12;12;12m"
+        SelPrimary = "${e}[38;2;12;12;12;48;2;242;242;242m"
+        SelSecond  = "${e}[38;2;18;18;18;48;2;206;206;206m"
+        SelFill    = "${e}[48;2;242;242;242m"
+        KeyBold    = "${e}[1;38;2;242;242;242;48;2;12;12;12m"
+        KeyLabel   = "${e}[38;2;182;182;182;48;2;12;12;12m"
+        FgOk       = "${e}[38;2;134;239;172;48;2;12;12;12m"
+        FgFixed    = "${e}[38;2;125;211;252;48;2;12;12;12m"
+        FgWarn     = "${e}[38;2;252;211;77;48;2;12;12;12m"
+        FgErr      = "${e}[38;2;252;165;165;48;2;12;12;12m"
+        FgPending  = "${e}[38;2;196;181;253;48;2;12;12;12m"
+    }
+}
+
 function Get-ConsoleSafeWidth {
-    $w = 78
+    $w = 90
     try {
         $cw = [Console]::WindowWidth
-        if ($cw -ge 50) { $w = [math]::Min(110, $cw - 1) }
+        if ($cw -ge 40) { $w = $cw - 1 }
     } catch {
-        $w = 78
+        $w = 90
     }
     return $w
+}
+
+function Get-ConsoleSafeHeight {
+    $h = 30
+    try {
+        $ch = [Console]::WindowHeight
+        if ($ch -ge 12) { $h = $ch }
+    } catch {
+        $h = 30
+    }
+    return $h
 }
 
 function Truncate-Text {
@@ -255,21 +573,21 @@ function Invoke-ConsoleTool {
 
 function New-DefaultScanConfig {
     $stepDefs = @(
-        [PSCustomObject]@{ Order=1;  Id='disk_health';      ShortName='Physical Disks & Free Space';    Tag='Get-PhysicalDisk + SMART' }
-        [PSCustomObject]@{ Order=2;  Id='power_energy';     ShortName='Power, Energy & Battery';        Tag='powercfg /energy (60s)' }
-        [PSCustomObject]@{ Order=3;  Id='reliability';      ShortName='Reliability & Crash Logs';       Tag='perfmon /rel + WHEA/BSOD' }
-        [PSCustomObject]@{ Order=4;  Id='drivers';          ShortName='Device Manager Drivers';         Tag='Broken/missing drivers' }
-        [PSCustomObject]@{ Order=5;  Id='security_posture'; ShortName='Security & Memory Integrity';    Tag='HVCI + Firewall + Defender' }
-        [PSCustomObject]@{ Order=6;  Id='wmi_repo';         ShortName='WMI Repository Repair';          Tag='winmgmt /verify & /salvage' }
-        [PSCustomObject]@{ Order=7;  Id='dism_scan';        ShortName='DISM Component Store Scan';      Tag='DISM /ScanHealth' }
-        [PSCustomObject]@{ Order=8;  Id='dism_restore';     ShortName='DISM Repair & Cleanup';          Tag='DISM /RestoreHealth + Clean' }
-        [PSCustomObject]@{ Order=9;  Id='sfc';              ShortName='System File Integrity';          Tag='sfc /scannow' }
-        [PSCustomObject]@{ Order=10; Id='chkdsk';           ShortName='All Connected Drives Scan';      Tag='chkdsk /scan (all drives)' }
-        [PSCustomObject]@{ Order=11; Id='opt_cleanup';      ShortName='SSD TRIM & Safe Temp Cleanup';   Tag='ReTrim + Temp > 24h' }
-        [PSCustomObject]@{ Order=12; Id='network_time';     ShortName='Network, DNS & Clock Sync';      Tag='flushdns + winsock + w32tm' }
-        [PSCustomObject]@{ Order=13; Id='core_services';    ShortName='Core Windows Services';          Tag='Recover stopped services' }
-        [PSCustomObject]@{ Order=14; Id='defender';         ShortName='Microsoft Defender Scan';        Tag='Start-MpScan' }
-        [PSCustomObject]@{ Order=15; Id='memdiag';          ShortName='Windows Memory Diagnostic';      Tag='RAM test on restart' }
+        [PSCustomObject]@{ Order=1;  Id='disk_health';      Group='Hardware';      ShortName='Physical Disks & Free Space';  Tag='Get-PhysicalDisk + SMART';     Description='Check drive health, SMART counters, and low free space' }
+        [PSCustomObject]@{ Order=2;  Id='power_energy';     Group='Hardware';      ShortName='Power, Energy & Battery';      Tag='powercfg /energy (60s)';       Description='Run 60s idle energy trace and laptop battery report' }
+        [PSCustomObject]@{ Order=3;  Id='reliability';      Group='Hardware';      ShortName='Reliability & Crash Logs';     Tag='perfmon /rel + WHEA/BSOD';     Description='Read stability score, app crashes, WHEA & BSOD dumps' }
+        [PSCustomObject]@{ Order=4;  Id='drivers';          Group='Hardware';      ShortName='Device Manager Drivers';       Tag='Broken/missing drivers';       Description='Find hardware devices with broken or missing drivers' }
+        [PSCustomObject]@{ Order=5;  Id='security_posture'; Group='System Repair'; ShortName='Security & Memory Integrity';  Tag='HVCI + Firewall + Defender';   Description='Verify Core Isolation HVCI, Firewall, and Defender status' }
+        [PSCustomObject]@{ Order=6;  Id='wmi_repo';         Group='System Repair'; ShortName='WMI Repository Repair';        Tag='winmgmt /verify & /salvage';   Description='Verify WMI database consistency and salvage if needed' }
+        [PSCustomObject]@{ Order=7;  Id='dism_scan';        Group='System Repair'; ShortName='DISM Component Store Scan';    Tag='DISM /ScanHealth';             Description='Scan the Windows component store for image corruption' }
+        [PSCustomObject]@{ Order=8;  Id='dism_restore';     Group='System Repair'; ShortName='DISM Repair & Cleanup';        Tag='DISM /RestoreHealth + Clean';  Description='Repair component store corruption and clean old updates' }
+        [PSCustomObject]@{ Order=9;  Id='sfc';              Group='System Repair'; ShortName='System File Integrity';        Tag='sfc /scannow';                 Description='Scan and repair protected Windows system files' }
+        [PSCustomObject]@{ Order=10; Id='chkdsk';           Group='System Repair'; ShortName='All Connected Drives Scan';    Tag='chkdsk /scan (all drives)';    Description='Run chkdsk /scan across all mounted connected drives' }
+        [PSCustomObject]@{ Order=11; Id='opt_cleanup';      Group='Maintenance';   ShortName='SSD TRIM & Safe Temp Cleanup'; Tag='ReTrim + Temp > 24h';          Description='Optimize SSDs with ReTrim and remove temp files > 24h' }
+        [PSCustomObject]@{ Order=12; Id='network_time';     Group='Maintenance';   ShortName='Network, DNS & Clock Sync';    Tag='flushdns + winsock + w32tm';   Description='Flush DNS cache, reset Winsock, and sync system clock' }
+        [PSCustomObject]@{ Order=13; Id='core_services';    Group='Maintenance';   ShortName='Core Windows Services';        Tag='Recover stopped services';     Description='Recover stopped networking, firewall & update services' }
+        [PSCustomObject]@{ Order=14; Id='defender';         Group='Maintenance';   ShortName='Microsoft Defender Scan';      Tag='Start-MpScan';                 Description='Update virus definitions and run Defender antivirus scan' }
+        [PSCustomObject]@{ Order=15; Id='memdiag';          Group='Restart';       ShortName='Windows Memory Diagnostic';    Tag='RAM test on restart';          Description='Queue one-time RAM test to run on next restart' }
     )
 
     $enabled = @{}
@@ -372,166 +690,904 @@ function Apply-ScanConfigInput {
     return [PSCustomObject]@{ Action='Continue'; Text=($notes -join ' ') }
 }
 
-function Get-MenuEntries {
-    param([Parameter(Mandatory = $true)]$Config)
-
-    $items = New-Object 'System.Collections.Generic.List[object]'
-    $items.Add([PSCustomObject]@{
-        Kind='Start'; Order=0; Checked=$null
-        Label='[ START SCAN ]'; Detail='Run selected checks now (or press S)'
-    })
-
-    foreach ($s in $Config.StepDefs) {
-        $isOn = [bool]$Config.Enabled[$s.Order]
-        $detail = $s.Tag
-        if ($s.Order -eq 14) { $detail = "Mode: $($Config.DefenderMode) (Space/Left/Right)" }
-        if ($s.Order -eq 15) { $detail = if ($Config.AutoRestart) { 'Runs during auto-restart' } else { 'Runs on next manual restart' } }
-        $numStr = ('{0,2}' -f $s.Order)
-        $items.Add([PSCustomObject]@{
-            Kind='Step'; Order=$s.Order; Checked=$isOn
-            Label="$numStr. $($s.ShortName)"; Detail=$detail
-        })
+function Format-DefenderModeLabel {
+    param([string]$Mode)
+    switch ($Mode) {
+        'FullScan'  { return 'Full Scan' }
+        'QuickScan' { return 'Quick Scan' }
+        default     { return 'Off' }
     }
-
-    $rstDetail = if ($Config.AutoRestart) { "Yes ($($Config.RestartDelaySec)s countdown)" } else { 'No (stay in Windows)' }
-    $items.Add([PSCustomObject]@{
-        Kind='Restart'; Order=0; Checked=[bool]$Config.AutoRestart
-        Label='Restart PC When Done'; Detail=$rstDetail
-    })
-
-    $openDetail = if ($Config.OpenReport) {
-        if ($Config.AutoRestart) { 'Yes (auto after reboot)' } else { 'Yes (immediately when done)' }
-    } else { 'No (save to Desktop only)' }
-    $items.Add([PSCustomObject]@{
-        Kind='OpenReport'; Order=0; Checked=[bool]$Config.OpenReport
-        Label='Open HTML Report Automatically'; Detail=$openDetail
-    })
-
-    $items.Add([PSCustomObject]@{
-        Kind='Exit'; Order=0; Checked=$null
-        Label='[ Exit ]'; Detail='Cancel without making any changes'
-    })
-
-    return @($items.ToArray())
 }
 
-function Invoke-MenuKeyAction {
+function Format-PresetLabel {
+    param([string]$Preset)
+    switch ($Preset) {
+        'Full'  { return 'Full Scan' }
+        'Quick' { return 'Quick Tune-Up' }
+        default { return 'Custom' }
+    }
+}
+
+function New-TuiMenuState {
+    return [PSCustomObject]@{
+        View              = 'Main'
+        TabIndex          = 0
+        CursorIndex       = 0
+        ScrollTop         = 0
+        SearchActive      = $false
+        SearchQuery       = ''
+        ReturnView        = 'Main'
+        ReturnTabIndex    = 0
+        ReturnCursorIndex = 0
+        Notice            = ''
+    }
+}
+
+function Get-TuiMenuViewModel {
     param(
         [Parameter(Mandatory = $true)]$Config,
-        [int]$CursorIndex,
-        [string]$KeyName,
-        [string]$KeyChar = ''
+        [Parameter(Mandatory = $true)]$State
     )
 
-    $entries = Get-MenuEntries -Config $Config
-    $maxIdx = $entries.Count - 1
-    if ($CursorIndex -lt 0) { $CursorIndex = 0 }
-    if ($CursorIndex -gt $maxIdx) { $CursorIndex = $maxIdx }
+    $g = Get-TuiGlyphs
+    $chev = $g.Chevron
+    $tabs = @('General', 'Hardware', 'System Repair', 'Maintenance', 'Restart')
+    $enabledCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
+    $defLabel = Format-DefenderModeLabel $Config.DefenderMode
+    $presetLabel = Format-PresetLabel $Config.Preset
+    $canResizeFont = ($null -ne $script:TuiCaps -and $script:TuiCaps.CanResizeFont)
+    $fontPx = if ($null -ne $script:TuiCaps) { [int]$script:TuiCaps.FontSizePx } else { 24 }
+    $rows = New-Object 'System.Collections.Generic.List[object]'
 
-    $current = $entries[$CursorIndex]
-    $upperChar = if ([string]::IsNullOrEmpty($KeyChar)) { '' } else { $KeyChar.ToUpperInvariant() }
+    $mode = 'Tabs'
+    $title = ''
+    $subtitle = ''
+    $showSearch = $false
+    $hints = New-Object 'System.Collections.Generic.List[object]'
 
+    if ($State.View -eq 'Main') {
+        if ($State.SearchActive) {
+            $showSearch = $true
+            $q = $State.SearchQuery.Trim()
+
+            if ([string]::IsNullOrEmpty($q)) {
+                $allBox = if ($enabledCount -eq 15) { '[x]' } elseif ($enabledCount -eq 0) { '[ ]' } else { '[-]' }
+                $rows.Add([PSCustomObject]@{
+                    Id='toggle_all'; Kind='ToggleAllChecks'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$true
+                    Primary="$allBox Enable all checks"; Secondary="$enabledCount/15 on"
+                    Description='Toggle all 15 diagnostic and repair checks on or off'; IsMuted=$false
+                })
+            }
+
+            $allSearchable = New-Object 'System.Collections.Generic.List[object]'
+            $allSearchable.Add([PSCustomObject]@{
+                Id='start'; Kind='Start'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                Primary='Start scan'; Secondary="$enabledCount/15 ready $chev"
+                Description='Run enabled checks and generate HTML report'; IsMuted=($enabledCount -eq 0); SearchText='start run scan begin go'
+            })
+            $allSearchable.Add([PSCustomObject]@{
+                Id='preset'; Kind='SubView'; Order=0; TargetView='Preset'; ValueArg=''; DividerAfter=$false
+                Primary='Preset'; Secondary="$presetLabel $chev"
+                Description='Apply Full Scan or Quick Tune-Up profile'; IsMuted=$false; SearchText='preset full quick custom profile'
+            })
+            $allSearchable.Add([PSCustomObject]@{
+                Id='open_report'; Kind='ToggleOpenReport'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                Primary='Open report'; Secondary=$(if ($Config.OpenReport) { '[x] On' } else { '[ ] Off' })
+                Description='Open HTML report automatically in your browser'
+                IsMuted=(-not [bool]$Config.OpenReport); SearchText='open html report browser automatically'
+            })
+            if ($canResizeFont) {
+                $allSearchable.Add([PSCustomObject]@{
+                    Id='text_size'; Kind='SubView'; Order=0; TargetView='TextSize'; ValueArg=''; DividerAfter=$false
+                    Primary='Text size'; Secondary="${fontPx}px $chev"
+                    Description='Adjust console font size (or press + / -)'
+                    IsMuted=$false; SearchText='text font size zoom bigger larger smaller scale'
+                })
+            }
+            foreach ($s in $Config.StepDefs) {
+                $isOn = [bool]$Config.Enabled[$s.Order]
+                $valTxt = if ($s.Order -eq 14) { "$defLabel $chev" } elseif ($isOn) { '[x] On' } else { '[ ] Off' }
+                $kind = if ($s.Order -eq 14) { 'StepDefender' } else { 'StepToggle' }
+                $allSearchable.Add([PSCustomObject]@{
+                    Id=$s.Id; Kind=$kind; Order=$s.Order; TargetView=$(if ($s.Order -eq 14) { 'Defender' } else { '' }); ValueArg=''; DividerAfter=$false
+                    Primary="$($s.Order). $($s.ShortName)"; Secondary=$valTxt
+                    Description=$s.Description; IsMuted=(-not $isOn)
+                    SearchText="$($s.Order) $($s.ShortName) $($s.Tag) $($s.Description) $($s.Group)"
+                })
+            }
+            $allSearchable.Add([PSCustomObject]@{
+                Id='restart'; Kind='ToggleRestart'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                Primary='Auto-restart'; Secondary=$(if ($Config.AutoRestart) { '[x] On' } else { '[ ] Off' })
+                Description='Restart automatically after all checks finish'
+                IsMuted=(-not [bool]$Config.AutoRestart); SearchText='auto restart reboot shutdown'
+            })
+            $allSearchable.Add([PSCustomObject]@{
+                Id='restart_delay'; Kind='SubView'; Order=0; TargetView='RestartDelay'; ValueArg=''; DividerAfter=$false
+                Primary='Restart countdown'; Secondary="$($Config.RestartDelaySec)s $chev"
+                Description='Wait time before rebooting (15s, 30s, or 60s)'
+                IsMuted=(-not [bool]$Config.AutoRestart); SearchText='restart countdown delay seconds timer'
+            })
+
+            foreach ($item in $allSearchable) {
+                if ([string]::IsNullOrEmpty($q) -or $item.SearchText.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $rows.Add($item)
+                }
+            }
+        } else {
+            switch ($State.TabIndex) {
+                0 {
+                    $startSec = if ($enabledCount -gt 0) { "$enabledCount/15 ready $chev" } else { "0/15 none $chev" }
+                    $rows.Add([PSCustomObject]@{
+                        Id='start'; Kind='Start'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                        Primary='Start scan'; Secondary=$startSec
+                        Description='Run enabled checks and generate HTML report'; IsMuted=($enabledCount -eq 0)
+                    })
+                    $rows.Add([PSCustomObject]@{
+                        Id='preset'; Kind='SubView'; Order=0; TargetView='Preset'; ValueArg=''; DividerAfter=$false
+                        Primary='Preset'; Secondary="$presetLabel $chev"
+                        Description='Apply Full Scan or Quick Tune-Up profile'; IsMuted=$false
+                    })
+                    $rows.Add([PSCustomObject]@{
+                        Id='open_report'; Kind='ToggleOpenReport'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                        Primary='Open report'; Secondary=$(if ($Config.OpenReport) { '[x] On' } else { '[ ] Off' })
+                        Description=$(if ($Config.AutoRestart) { 'Reopen updated HTML report automatically after restart' } else { 'Open HTML report in default browser when finished' })
+                        IsMuted=(-not [bool]$Config.OpenReport)
+                    })
+                    if ($canResizeFont) {
+                        $rows.Add([PSCustomObject]@{
+                            Id='text_size'; Kind='SubView'; Order=0; TargetView='TextSize'; ValueArg=''; DividerAfter=$false
+                            Primary='Text size'; Secondary="${fontPx}px $chev"
+                            Description='Adjust console font size (or press + / -)'
+                            IsMuted=$false
+                        })
+                    }
+                    $rows.Add([PSCustomObject]@{
+                        Id='exit'; Kind='Exit'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                        Primary='Exit'; Secondary="Close $chev"
+                        Description='Exit Windows Scan & Fix without making any changes'
+                        IsMuted=$false
+                    })
+                }
+                1 {
+                    foreach ($s in ($Config.StepDefs | Where-Object { $_.Group -eq 'Hardware' })) {
+                        $isOn = [bool]$Config.Enabled[$s.Order]
+                        $rows.Add([PSCustomObject]@{
+                            Id=$s.Id; Kind='StepToggle'; Order=$s.Order; TargetView=''; ValueArg=''; DividerAfter=$false
+                            Primary="$($s.Order). $($s.ShortName)"; Secondary=$(if ($isOn) { '[x] On' } else { '[ ] Off' })
+                            Description=$s.Description; IsMuted=(-not $isOn)
+                        })
+                    }
+                }
+                2 {
+                    foreach ($s in ($Config.StepDefs | Where-Object { $_.Group -eq 'System Repair' })) {
+                        $isOn = [bool]$Config.Enabled[$s.Order]
+                        $rows.Add([PSCustomObject]@{
+                            Id=$s.Id; Kind='StepToggle'; Order=$s.Order; TargetView=''; ValueArg=''; DividerAfter=$false
+                            Primary="$($s.Order). $($s.ShortName)"; Secondary=$(if ($isOn) { '[x] On' } else { '[ ] Off' })
+                            Description=$s.Description; IsMuted=(-not $isOn)
+                        })
+                    }
+                }
+                3 {
+                    foreach ($s in ($Config.StepDefs | Where-Object { $_.Group -eq 'Maintenance' })) {
+                        $isOn = [bool]$Config.Enabled[$s.Order]
+                        $isDef = ($s.Order -eq 14)
+                        $rows.Add([PSCustomObject]@{
+                            Id=$s.Id; Kind=$(if ($isDef) { 'StepDefender' } else { 'StepToggle' }); Order=$s.Order
+                            TargetView=$(if ($isDef) { 'Defender' } else { '' }); ValueArg=''; DividerAfter=$false
+                            Primary="$($s.Order). $($s.ShortName)"
+                            Secondary=$(if ($isDef) { "$defLabel $chev" } elseif ($isOn) { '[x] On' } else { '[ ] Off' })
+                            Description=$s.Description; IsMuted=(-not $isOn)
+                        })
+                    }
+                }
+                4 {
+                    $rows.Add([PSCustomObject]@{
+                        Id='restart'; Kind='ToggleRestart'; Order=0; TargetView=''; ValueArg=''; DividerAfter=$false
+                        Primary='Auto-restart'; Secondary=$(if ($Config.AutoRestart) { '[x] On' } else { '[ ] Off' })
+                        Description='Automatically restart PC after all checks finish'
+                        IsMuted=(-not [bool]$Config.AutoRestart)
+                    })
+                    $rows.Add([PSCustomObject]@{
+                        Id='restart_delay'; Kind='SubView'; Order=0; TargetView='RestartDelay'; ValueArg=''; DividerAfter=$false
+                        Primary='Restart countdown'; Secondary="$($Config.RestartDelaySec)s $chev"
+                        Description='Wait time before rebooting (15s, 30s, or 60s)'
+                        IsMuted=(-not [bool]$Config.AutoRestart)
+                    })
+                    $memStep = $Config.StepDefs | Where-Object { $_.Order -eq 15 } | Select-Object -First 1
+                    $memOn = [bool]$Config.Enabled[15]
+                    $rows.Add([PSCustomObject]@{
+                        Id='memdiag'; Kind='StepToggle'; Order=15; TargetView=''; ValueArg=''; DividerAfter=$false
+                        Primary="15. $($memStep.ShortName)"; Secondary=$(if ($memOn) { '[x] On' } else { '[ ] Off' })
+                        Description=$(if ($Config.AutoRestart) { 'Run Windows RAM test during automatic restart' } else { 'Queue Windows RAM test for next manual restart' })
+                        IsMuted=(-not $memOn)
+                    })
+                }
+            }
+        }
+    } elseif ($State.View -eq 'Preset') {
+        $mode = 'SubView'
+        $title = 'Preset'
+        $subtitle = if ($Config.Preset -eq 'Custom') {
+            "Currently Custom ($enabledCount/15 checks). Pick a preset to reset all tabs."
+        } else {
+            'Apply a scan profile across all tabs'
+        }
+        $isFull = ($Config.Preset -eq 'Full')
+        $isQuick = ($Config.Preset -eq 'Quick')
+        $rows.Add([PSCustomObject]@{
+            Id='preset_full'; Kind='PickPreset'; Order=0; TargetView=''; ValueArg='Full'; DividerAfter=$false
+            Primary="1. $(if ($isFull) { '[x]' } else { '[ ]' }) Full Scan"; Secondary=''
+            Description='All 15 checks, Full Defender scan, RAM test, and auto-restart'; IsMuted=$false
+        })
+        $rows.Add([PSCustomObject]@{
+            Id='preset_quick'; Kind='PickPreset'; Order=0; TargetView=''; ValueArg='Quick'; DividerAfter=$false
+            Primary="2. $(if ($isQuick) { '[x]' } else { '[ ]' }) Quick Tune-Up"; Secondary=''
+            Description='13 checks, Quick Defender scan, skips 60s energy trace and reboot'; IsMuted=$false
+        })
+    } elseif ($State.View -eq 'Defender') {
+        $mode = 'SubView'
+        $title = 'Microsoft Defender Scan'
+        $subtitle = 'Configure antivirus scan depth for Step 14'
+        $rows.Add([PSCustomObject]@{
+            Id='def_full'; Kind='PickDefender'; Order=14; TargetView=''; ValueArg='FullScan'; DividerAfter=$false
+            Primary="1. $(if ($Config.DefenderMode -eq 'FullScan') { '[x]' } else { '[ ]' }) Full Scan"; Secondary=''
+            Description='Update definitions and scan the entire system (thorough, slower)'; IsMuted=$false
+        })
+        $rows.Add([PSCustomObject]@{
+            Id='def_quick'; Kind='PickDefender'; Order=14; TargetView=''; ValueArg='QuickScan'; DividerAfter=$false
+            Primary="2. $(if ($Config.DefenderMode -eq 'QuickScan') { '[x]' } else { '[ ]' }) Quick Scan"; Secondary=''
+            Description='Update definitions and scan common malware locations (faster)'; IsMuted=$false
+        })
+        $rows.Add([PSCustomObject]@{
+            Id='def_off'; Kind='PickDefender'; Order=14; TargetView=''; ValueArg='Off'; DividerAfter=$false
+            Primary="3. $(if ($Config.DefenderMode -eq 'Off') { '[x]' } else { '[ ]' }) Off"; Secondary=''
+            Description='Skip the Microsoft Defender antivirus scan for this run'; IsMuted=$false
+        })
+    } elseif ($State.View -eq 'RestartDelay') {
+        $mode = 'SubView'
+        $title = 'Restart Countdown'
+        $subtitle = 'Choose how long to wait before restarting after scan completes'
+        foreach ($opt in @(
+            @{ Num=1; Sec=15; Desc='Short countdown before automatic restart' },
+            @{ Num=2; Sec=30; Desc='Default countdown with time to cancel if needed' },
+            @{ Num=3; Sec=60; Desc='Extended countdown to review summary before reboot' }
+        )) {
+            $mark = if ([int]$Config.RestartDelaySec -eq $opt.Sec) { '[x]' } else { '[ ]' }
+            $rows.Add([PSCustomObject]@{
+                Id="delay_$($opt.Sec)"; Kind='PickRestartDelay'; Order=0; TargetView=''; ValueArg=[string]$opt.Sec; DividerAfter=$false
+                Primary="$($opt.Num). $mark $($opt.Sec) seconds"; Secondary=''
+                Description=$opt.Desc; IsMuted=$false
+            })
+        }
+    } elseif ($State.View -eq 'TextSize') {
+        $mode = 'SubView'
+        $title = 'Text Size'
+        $subtitle = 'Choose console font height (space previews, enter confirms)'
+        foreach ($opt in @(
+            @{ Num=1; Px=20; Name='Normal (20px)';      Desc='Compact text for smaller laptop screens' },
+            @{ Num=2; Px=24; Name='Large (24px)';       Desc='Comfortable default size for 1080p monitors' },
+            @{ Num=3; Px=28; Name='Extra Large (28px)'; Desc='High-readability text for large or HiDPI displays' },
+            @{ Num=4; Px=32; Name='Huge (32px)';        Desc='Maximum readability for 1440p / 4K displays' }
+        )) {
+            $mark = if ($fontPx -eq $opt.Px) { '[x]' } else { '[ ]' }
+            $rows.Add([PSCustomObject]@{
+                Id="font_$($opt.Px)"; Kind='PickFontSize'; Order=0; TargetView=''; ValueArg=[string]$opt.Px; DividerAfter=$false
+                Primary="$($opt.Num). $mark $($opt.Name)"; Secondary=''
+                Description=$opt.Desc; IsMuted=$false
+            })
+        }
+    }
+
+    # Build context-sensitive footer keybind hints
+    $curRow = if ($rows.Count -gt 0 -and $State.CursorIndex -ge 0 -and $State.CursorIndex -lt $rows.Count) {
+        $rows[$State.CursorIndex]
+    } elseif ($rows.Count -gt 0) {
+        $rows[0]
+    } else {
+        $null
+    }
+
+    if ($State.View -eq 'Main') {
+        if ($State.SearchActive) {
+            $enterLbl = if ($null -ne $curRow -and $curRow.Kind -eq 'Start') { 'start' } elseif ($null -ne $curRow -and $curRow.Kind -in @('SubView', 'StepDefender')) { 'open' } else { 'toggle' }
+            $hints.Add([PSCustomObject]@{ Key='enter'; Label=$enterLbl })
+            $hints.Add([PSCustomObject]@{ Key='esc'; Label='clear search' })
+        } else {
+            $enterLbl = 'toggle'
+            if ($null -ne $curRow) {
+                if ($curRow.Kind -eq 'Start') { $enterLbl = 'start' }
+                elseif ($curRow.Kind -eq 'Exit') { $enterLbl = 'exit' }
+                elseif ($curRow.Kind -in @('SubView', 'StepDefender')) { $enterLbl = 'open' }
+            }
+            $hints.Add([PSCustomObject]@{ Key='left/right'; Label='group' })
+            $hints.Add([PSCustomObject]@{ Key='/'; Label='search' })
+            $hints.Add([PSCustomObject]@{ Key='enter'; Label=$enterLbl })
+            $hints.Add([PSCustomObject]@{ Key='s'; Label='start scan' })
+            if ($canResizeFont) {
+                $hints.Add([PSCustomObject]@{ Key='+/-'; Label='text size' })
+            }
+            $hints.Add([PSCustomObject]@{ Key='esc'; Label='close' })
+        }
+    } else {
+        $hints.Add([PSCustomObject]@{ Key='enter'; Label='select' })
+        $hints.Add([PSCustomObject]@{ Key='esc'; Label='back' })
+    }
+
+    return [PSCustomObject]@{
+        Mode              = $mode
+        Tabs              = $tabs
+        ActiveTabIndex    = $State.TabIndex
+        Title             = $title
+        Subtitle          = $subtitle
+        ShowSearch        = $showSearch
+        SearchQuery       = $State.SearchQuery
+        SearchPlaceholder = 'Type to search'
+        Rows              = @($rows.ToArray())
+        Hints             = @($hints.ToArray())
+        EnabledCount      = $enabledCount
+        PresetLabel       = $presetLabel
+        Notice            = $State.Notice
+    }
+}
+
+function Invoke-TuiMenuKey {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][string]$KeyName,
+        [string]$KeyChar = '',
+        [bool]$ShiftPressed = $false
+    )
+
+    $State.Notice = ''
+    $vm = Get-TuiMenuViewModel -Config $Config -State $State
+    $rows = $vm.Rows
+    $rowCount = $rows.Count
+    if ($rowCount -eq 0) {
+        $State.CursorIndex = 0
+    } else {
+        if ($State.CursorIndex -lt 0) { $State.CursorIndex = 0 }
+        if ($State.CursorIndex -ge $rowCount) { $State.CursorIndex = $rowCount - 1 }
+    }
+    $current = if ($rowCount -gt 0) { $rows[$State.CursorIndex] } else { $null }
+
+    $isTextSearchMode = ($State.View -eq 'Main' -and $State.SearchActive)
+
+    # Vertical navigation works identically across all views
     if ($KeyName -eq 'UpArrow') {
-        $next = if ($CursorIndex -le 0) { $maxIdx } else { $CursorIndex - 1 }
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$next; Feedback='' }
+        if ($rowCount -gt 0) { $State.CursorIndex = if ($State.CursorIndex -le 0) { $rowCount - 1 } else { $State.CursorIndex - 1 } }
+        return 'Continue'
     }
     if ($KeyName -eq 'DownArrow') {
-        $next = if ($CursorIndex -ge $maxIdx) { 0 } else { $CursorIndex + 1 }
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$next; Feedback='' }
+        if ($rowCount -gt 0) { $State.CursorIndex = if ($State.CursorIndex -ge ($rowCount - 1)) { 0 } else { $State.CursorIndex + 1 } }
+        return 'Continue'
     }
     if ($KeyName -eq 'Home') {
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=0; Feedback='' }
+        $State.CursorIndex = 0; $State.ScrollTop = 0
+        return 'Continue'
     }
     if ($KeyName -eq 'End') {
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$maxIdx; Feedback='' }
+        if ($rowCount -gt 0) { $State.CursorIndex = $rowCount - 1 }
+        return 'Continue'
     }
     if ($KeyName -eq 'PageUp') {
-        $next = [math]::Max(0, $CursorIndex - 5)
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$next; Feedback='' }
+        $State.CursorIndex = [math]::Max(0, $State.CursorIndex - 6)
+        return 'Continue'
     }
     if ($KeyName -eq 'PageDown') {
-        $next = [math]::Min($maxIdx, $CursorIndex + 5)
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$next; Feedback='' }
-    }
-    if ($KeyName -eq 'Escape' -or $upperChar -eq 'X') {
-        return [PSCustomObject]@{ Action='Exit'; CursorIndex=$CursorIndex; Feedback='' }
+        if ($rowCount -gt 0) { $State.CursorIndex = [math]::Min($rowCount - 1, $State.CursorIndex + 6) }
+        return 'Continue'
     }
 
-    if ($upperChar -eq 'S') {
-        $enabledCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
-        if ($enabledCount -eq 0) {
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Select at least one check before starting.' }
+    # Escape behavior: clear search -> go back -> exit
+    if ($KeyName -eq 'Escape') {
+        if ($State.View -eq 'Main') {
+            if ($State.SearchActive) {
+                $State.SearchActive = $false
+                $State.SearchQuery = ''
+                $State.CursorIndex = 0
+                $State.ScrollTop = 0
+                return 'Continue'
+            }
+            return 'Exit'
         }
-        return [PSCustomObject]@{ Action='Start'; CursorIndex=$CursorIndex; Feedback='' }
-    }
-    if ($upperChar -eq 'F') {
-        [void](Apply-ScanConfigInput -Config $Config -InputLine 'F')
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Preset: Full Scan (all 15 checks + Full Defender + Restart).' }
-    }
-    if ($upperChar -eq 'Q') {
-        [void](Apply-ScanConfigInput -Config $Config -InputLine 'Q')
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Preset: Quick Tune-Up (Quick Defender, no 60s energy trace, no reboot).' }
-    }
-    if ($upperChar -eq 'A') {
-        [void](Apply-ScanConfigInput -Config $Config -InputLine 'A')
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Selected all 15 checks.' }
-    }
-    if ($upperChar -eq 'N') {
-        [void](Apply-ScanConfigInput -Config $Config -InputLine 'N')
-        return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Deselected all checks.' }
+        $State.View = $State.ReturnView
+        $State.TabIndex = $State.ReturnTabIndex
+        $State.CursorIndex = $State.ReturnCursorIndex
+        $State.ScrollTop = 0
+        $State.SearchQuery = ''
+        return 'Continue'
     }
 
-    if ($KeyName -in @('Spacebar', 'Enter', 'RightArrow', 'LeftArrow')) {
-        if ($current.Kind -eq 'Start') {
-            if ($KeyName -in @('Enter', 'Spacebar')) {
+    # Tab switching on Main (when not searching)
+    if ($State.View -eq 'Main' -and -not $State.SearchActive) {
+        $tabCount = $vm.Tabs.Count
+        if ($KeyName -eq 'LeftArrow' -or ($KeyName -eq 'Tab' -and $ShiftPressed)) {
+            $State.TabIndex = if ($State.TabIndex -le 0) { $tabCount - 1 } else { $State.TabIndex - 1 }
+            $State.CursorIndex = 0
+            $State.ScrollTop = 0
+            return 'Continue'
+        }
+        if ($KeyName -eq 'RightArrow' -or $KeyName -eq 'Tab') {
+            $State.TabIndex = if ($State.TabIndex -ge ($tabCount - 1)) { 0 } else { $State.TabIndex + 1 }
+            $State.CursorIndex = 0
+            $State.ScrollTop = 0
+            return 'Continue'
+        }
+        if ($KeyChar -eq '/') {
+            $State.SearchActive = $true
+            $State.SearchQuery = ''
+            $State.CursorIndex = 0
+            $State.ScrollTop = 0
+            return 'Continue'
+        }
+        if ($KeyChar -in @('+', '=') -and $null -ne $script:TuiCaps -and $script:TuiCaps.CanResizeFont) {
+            $nextPx = [math]::Min(36, [int]$script:TuiCaps.FontSizePx + 2)
+            if (Set-TuiFontSize -HeightPx $nextPx) { $State.Notice = "Text size: ${nextPx}px" }
+            return 'Continue'
+        }
+        if ($KeyChar -eq '-' -and $null -ne $script:TuiCaps -and $script:TuiCaps.CanResizeFont) {
+            $nextPx = [math]::Max(16, [int]$script:TuiCaps.FontSizePx - 2)
+            if (Set-TuiFontSize -HeightPx $nextPx) { $State.Notice = "Text size: ${nextPx}px" }
+            return 'Continue'
+        }
+    }
+
+    # Text search editing (Main '/' search mode)
+    if ($isTextSearchMode) {
+        if ($KeyName -eq 'Backspace') {
+            if ($State.SearchQuery.Length -gt 0) {
+                $State.SearchQuery = $State.SearchQuery.Substring(0, $State.SearchQuery.Length - 1)
+                $State.CursorIndex = 0
+                $State.ScrollTop = 0
+            } else {
+                $State.SearchActive = $false
+                $State.CursorIndex = 0
+                $State.ScrollTop = 0
+            }
+            return 'Continue'
+        }
+
+        if ($KeyName -ne 'Enter') {
+            $isSpaceToggle = ($KeyName -eq 'Spacebar' -and [string]::IsNullOrEmpty($State.SearchQuery))
+            if (-not $isSpaceToggle -and -not [string]::IsNullOrEmpty($KeyChar)) {
+                $code = [int][char]$KeyChar[0]
+                if ($code -ge 32 -and $code -ne 127) {
+                    $State.SearchQuery += $KeyChar
+                    $State.CursorIndex = 0
+                    $State.ScrollTop = 0
+                    return 'Continue'
+                }
+            }
+        }
+    }
+
+    # Quick keyboard shortcuts on Main (when not typing search)
+    if ($State.View -eq 'Main' -and -not $State.SearchActive -and -not [string]::IsNullOrEmpty($KeyChar)) {
+        $up = $KeyChar.ToUpperInvariant()
+        if ($up -eq 'S') {
+            $enabledCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
+            if ($enabledCount -eq 0) {
+                $State.Notice = 'Enable at least one check before starting.'
+                return 'Continue'
+            }
+            return 'Start'
+        }
+        if ($up -eq 'F') {
+            [void](Apply-ScanConfigInput -Config $Config -InputLine 'F')
+            $State.Notice = 'Applied Full Scan preset.'
+            return 'Continue'
+        }
+        if ($up -eq 'Q') {
+            [void](Apply-ScanConfigInput -Config $Config -InputLine 'Q')
+            $State.Notice = 'Applied Quick Tune-Up preset.'
+            return 'Continue'
+        }
+        if ($up -eq 'A') {
+            [void](Apply-ScanConfigInput -Config $Config -InputLine 'A')
+            $State.Notice = 'Enabled all 15 checks.'
+            return 'Continue'
+        }
+        if ($up -eq 'N') {
+            [void](Apply-ScanConfigInput -Config $Config -InputLine 'N')
+            $State.Notice = 'Disabled all checks.'
+            return 'Continue'
+        }
+    }
+
+    # Number keys 1..4 in numbered picker sub-views
+    if ($State.View -in @('Preset', 'Defender', 'RestartDelay', 'TextSize') -and $KeyChar -match '^[1-4]$') {
+        $idx = [int]$KeyChar - 1
+        if ($idx -ge 0 -and $idx -lt $rowCount) {
+            $State.CursorIndex = $idx
+            $current = $rows[$idx]
+            $KeyName = 'Enter'
+        }
+    }
+
+    # Activate / Toggle on Enter or Spacebar
+    if ($null -ne $current -and ($KeyName -eq 'Enter' -or $KeyName -eq 'Spacebar')) {
+        switch ($current.Kind) {
+            'Start' {
                 $enabledCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
                 if ($enabledCount -eq 0) {
-                    return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='Select at least one check before starting.' }
+                    $State.Notice = 'Enable at least one check before starting.'
+                    return 'Continue'
                 }
-                return [PSCustomObject]@{ Action='Start'; CursorIndex=$CursorIndex; Feedback='' }
+                return 'Start'
             }
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
-        }
-        if ($current.Kind -eq 'Exit') {
-            if ($KeyName -in @('Enter', 'Spacebar')) {
-                return [PSCustomObject]@{ Action='Exit'; CursorIndex=$CursorIndex; Feedback='' }
+            'Exit' {
+                return 'Exit'
             }
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
-        }
-        if ($current.Kind -eq 'Step') {
-            if ($current.Order -eq 14) {
-                if ($KeyName -eq 'LeftArrow') {
-                    switch ($Config.DefenderMode) {
-                        'FullScan'  { $Config.DefenderMode = 'Off';       $Config.Enabled[14] = $false }
-                        'Off'       { $Config.DefenderMode = 'QuickScan'; $Config.Enabled[14] = $true }
-                        default     { $Config.DefenderMode = 'FullScan';  $Config.Enabled[14] = $true }
-                    }
+            'SubView' {
+                if ($KeyName -eq 'Spacebar' -and $current.TargetView -eq 'Preset') {
+                    $nextPreset = if ($Config.Preset -eq 'Full') { 'Q' } else { 'F' }
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine $nextPreset)
+                    return 'Continue'
+                }
+                if ($KeyName -eq 'Spacebar' -and $current.TargetView -eq 'RestartDelay') {
+                    $Config.RestartDelaySec = switch ([int]$Config.RestartDelaySec) { 15 { 30 } 30 { 60 } default { 15 } }
+                    return 'Continue'
+                }
+                if ($KeyName -eq 'Spacebar' -and $current.TargetView -eq 'TextSize' -and $null -ne $script:TuiCaps -and $script:TuiCaps.CanResizeFont) {
+                    $nextPx = switch ([int]$script:TuiCaps.FontSizePx) { { $_ -lt 24 } { 24 } { $_ -lt 28 } { 28 } { $_ -lt 32 } { 32 } default { 20 } }
+                    [void](Set-TuiFontSize -HeightPx $nextPx)
+                    return 'Continue'
+                }
+
+                $State.ReturnView = $State.View
+                $State.ReturnTabIndex = $State.TabIndex
+                $State.ReturnCursorIndex = $State.CursorIndex
+                $State.View = $current.TargetView
+                $State.SearchQuery = ''
+                $State.ScrollTop = 0
+
+                if ($current.TargetView -eq 'Preset') {
+                    $State.CursorIndex = if ($Config.Preset -eq 'Quick') { 1 } else { 0 }
+                } elseif ($current.TargetView -eq 'Defender') {
+                    $State.CursorIndex = switch ($Config.DefenderMode) { 'FullScan' { 0 } 'QuickScan' { 1 } default { 2 } }
+                } elseif ($current.TargetView -eq 'RestartDelay') {
+                    $State.CursorIndex = switch ([int]$Config.RestartDelaySec) { 15 { 0 } 30 { 1 } default { 2 } }
+                } elseif ($current.TargetView -eq 'TextSize') {
+                    $curPx = if ($null -ne $script:TuiCaps) { [int]$script:TuiCaps.FontSizePx } else { 24 }
+                    $State.CursorIndex = if ($curPx -le 21) { 0 } elseif ($curPx -le 26) { 1 } elseif ($curPx -le 30) { 2 } else { 3 }
                 } else {
-                    switch ($Config.DefenderMode) {
-                        'FullScan'  { $Config.DefenderMode = 'QuickScan'; $Config.Enabled[14] = $true }
-                        'QuickScan' { $Config.DefenderMode = 'Off';       $Config.Enabled[14] = $false }
-                        default     { $Config.DefenderMode = 'FullScan';  $Config.Enabled[14] = $true }
-                    }
+                    $State.CursorIndex = 0
                 }
-                $Config.Preset = 'Custom'
-                return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback="Defender mode set to: $($Config.DefenderMode)" }
+                return 'Continue'
             }
-            $Config.Enabled[$current.Order] = -not [bool]$Config.Enabled[$current.Order]
-            $Config.Preset = 'Custom'
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
-        }
-        if ($current.Kind -eq 'Restart') {
-            $Config.AutoRestart = -not [bool]$Config.AutoRestart
-            $Config.Preset = 'Custom'
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
-        }
-        if ($current.Kind -eq 'OpenReport') {
-            $Config.OpenReport = -not [bool]$Config.OpenReport
-            return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
+            'StepDefender' {
+                if ($KeyName -eq 'Spacebar') {
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine 'D')
+                    return 'Continue'
+                }
+                $State.ReturnView = $State.View
+                $State.ReturnTabIndex = $State.TabIndex
+                $State.ReturnCursorIndex = $State.CursorIndex
+                $State.View = 'Defender'
+                $State.SearchQuery = ''
+                $State.ScrollTop = 0
+                $State.CursorIndex = switch ($Config.DefenderMode) { 'FullScan' { 0 } 'QuickScan' { 1 } default { 2 } }
+                return 'Continue'
+            }
+            'StepToggle' {
+                $ord = [int]$current.Order
+                $newVal = -not [bool]$Config.Enabled[$ord]
+                $Config.Enabled[$ord] = $newVal
+                $Config.Preset = 'Custom'
+                if ($ord -eq 14) {
+                    if ($newVal -and $Config.DefenderMode -eq 'Off') { $Config.DefenderMode = 'FullScan' }
+                    if (-not $newVal) { $Config.DefenderMode = 'Off' }
+                }
+                return 'Continue'
+            }
+            'ToggleAllChecks' {
+                $enabledCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
+                if ($enabledCount -eq 15) {
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine 'N')
+                } else {
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine 'A')
+                }
+                return 'Continue'
+            }
+            'ToggleRestart' {
+                $Config.AutoRestart = -not [bool]$Config.AutoRestart
+                $Config.Preset = 'Custom'
+                return 'Continue'
+            }
+            'ToggleOpenReport' {
+                $Config.OpenReport = -not [bool]$Config.OpenReport
+                return 'Continue'
+            }
+            'PickPreset' {
+                if ($current.ValueArg -eq 'Full') {
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine 'F')
+                } elseif ($current.ValueArg -eq 'Quick') {
+                    [void](Apply-ScanConfigInput -Config $Config -InputLine 'Q')
+                }
+                if ($KeyName -eq 'Enter') {
+                    $State.View = $State.ReturnView
+                    $State.TabIndex = $State.ReturnTabIndex
+                    $State.CursorIndex = $State.ReturnCursorIndex
+                    $State.ScrollTop = 0
+                }
+                return 'Continue'
+            }
+            'PickDefender' {
+                $Config.DefenderMode = $current.ValueArg
+                $Config.Enabled[14] = ($current.ValueArg -ne 'Off')
+                $Config.Preset = 'Custom'
+                if ($KeyName -eq 'Enter') {
+                    $State.View = $State.ReturnView
+                    $State.TabIndex = $State.ReturnTabIndex
+                    $State.CursorIndex = $State.ReturnCursorIndex
+                    $State.ScrollTop = 0
+                }
+                return 'Continue'
+            }
+            'PickRestartDelay' {
+                $Config.RestartDelaySec = [int]$current.ValueArg
+                if ($KeyName -eq 'Enter') {
+                    $State.View = $State.ReturnView
+                    $State.TabIndex = $State.ReturnTabIndex
+                    $State.CursorIndex = $State.ReturnCursorIndex
+                    $State.ScrollTop = 0
+                }
+                return 'Continue'
+            }
+            'PickFontSize' {
+                [void](Set-TuiFontSize -HeightPx ([int]$current.ValueArg))
+                if ($KeyName -eq 'Enter') {
+                    $State.View = $State.ReturnView
+                    $State.TabIndex = $State.ReturnTabIndex
+                    $State.CursorIndex = $State.ReturnCursorIndex
+                    $State.ScrollTop = 0
+                }
+                return 'Continue'
+            }
         }
     }
 
-    return [PSCustomObject]@{ Action='Continue'; CursorIndex=$CursorIndex; Feedback='' }
+    return 'Continue'
+}
+
+function Render-TuiMenuFrame {
+    param(
+        [Parameter(Mandatory = $true)]$ViewModel,
+        [Parameter(Mandatory = $true)]$State,
+        [int]$Width,
+        [int]$Height,
+        [switch]$FullClear
+    )
+
+    $caps = Initialize-TuiConsole
+    $g = Get-TuiGlyphs
+    $rows = $ViewModel.Rows
+    $rowCount = $rows.Count
+
+    # Compute responsive column widths matching the clean aligned monochrome grid
+    $hasSec = $false
+    $maxPri = 0
+    $maxSec = 0
+    foreach ($r in $rows) {
+        if ($r.Primary.Length -gt $maxPri) { $maxPri = $r.Primary.Length }
+        if (-not [string]::IsNullOrEmpty($r.Secondary)) {
+            $hasSec = $true
+            if ($r.Secondary.Length -gt $maxSec) { $maxSec = $r.Secondary.Length }
+        }
+    }
+
+    if ($hasSec) {
+        $col1W = [math]::Max(18, [math]::Min(30, $maxPri + 3))
+        $col2W = [math]::Max(13, [math]::Min(18, $maxSec + 4))
+    } else {
+        $col1W = [math]::Max(20, [math]::Min(36, $maxPri + 3))
+        $col2W = 0
+    }
+    if (($col1W + $col2W + 18) -gt $Width) {
+        $col1W = [math]::Max(14, [math]::Min($col1W, [int]($Width * 0.42)))
+        if ($hasSec) { $col2W = [math]::Max(10, [math]::Min($col2W, [int]($Width * 0.22))) }
+    }
+    $descMax = [math]::Max(0, $Width - 2 - $col1W - $col2W - 1)
+
+    # Calculate vertical viewport budget
+    $headerLines = if ($ViewModel.Mode -eq 'Tabs') {
+        if ($ViewModel.ShowSearch) { 4 } else { 2 }
+    } else {
+        if ($ViewModel.ShowSearch) { 5 } else { 3 }
+    }
+    $footerLines = if (-not [string]::IsNullOrWhiteSpace($ViewModel.Notice)) { 3 } else { 2 }
+    $extraDividerLines = @($rows | Where-Object { $_.DividerAfter }).Count
+    $availRows = [math]::Max(4, $Height - $headerLines - $footerLines - 2)
+
+    if ($rowCount -eq 0) {
+        $State.CursorIndex = 0
+        $State.ScrollTop = 0
+    } else {
+        if ($State.CursorIndex -ge $rowCount) { $State.CursorIndex = $rowCount - 1 }
+        if ($State.CursorIndex -lt 0) { $State.CursorIndex = 0 }
+        $visBudget = [math]::Max(3, $availRows - $extraDividerLines)
+        if ($State.CursorIndex -lt $State.ScrollTop) { $State.ScrollTop = $State.CursorIndex }
+        if ($State.CursorIndex -ge ($State.ScrollTop + $visBudget)) { $State.ScrollTop = $State.CursorIndex - $visBudget + 1 }
+        $maxScroll = [math]::Max(0, $rowCount - $visBudget)
+        if ($State.ScrollTop -gt $maxScroll) { $State.ScrollTop = $maxScroll }
+        $endIdx = [math]::Min($rowCount - 1, $State.ScrollTop + $visBudget - 1)
+    }
+
+    if ($caps.UseVt) {
+        $a = Get-TuiAnsi
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append($(if ($FullClear) { $a.ClearAll } else { $a.Home }))
+
+        # Top header
+        if ($ViewModel.Mode -eq 'Tabs') {
+            [void]$sb.Append($a.BgDark + ' ')
+            $tabTextLen = 1
+            for ($t = 0; $t -lt $ViewModel.Tabs.Count; $t++) {
+                $tName = $ViewModel.Tabs[$t]
+                if ($t -gt 0) {
+                    [void]$sb.Append($a.BgDark + '  ')
+                    $tabTextLen += 2
+                }
+                if ($t -eq $ViewModel.ActiveTabIndex -and -not $ViewModel.ShowSearch) {
+                    [void]$sb.Append($a.TabActive + " $tName " + $a.Reset + $a.BgDark)
+                    $tabTextLen += ($tName.Length + 2)
+                } else {
+                    [void]$sb.Append($a.TabIdle + " $tName ")
+                    $tabTextLen += ($tName.Length + 2)
+                }
+            }
+            $metaStr = "$env:COMPUTERNAME $($g.Dot) $($ViewModel.EnabledCount)/15"
+            $gap = $Width - $tabTextLen - $metaStr.Length - 1
+            if ($gap -ge 3) {
+                [void]$sb.Append((' ' * $gap) + $a.FgDim + $metaStr)
+            }
+            [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+            [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        } else {
+            [void]$sb.Append($a.FgBright + '  ' + (Truncate-Text $ViewModel.Title ($Width - 2)) + $a.BgDark + $a.ClearLine + "`r`n")
+            [void]$sb.Append($a.FgMuted + '  ' + (Truncate-Text $ViewModel.Subtitle ($Width - 2)) + $a.BgDark + $a.ClearLine + "`r`n")
+            [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        }
+
+        # Inline search input (Screenshot 3 style / Main '/' search)
+        if ($ViewModel.ShowSearch) {
+            if ([string]::IsNullOrEmpty($ViewModel.SearchQuery)) {
+                $ph = if ($ViewModel.Mode -eq 'Tabs') { "/ $($ViewModel.SearchPlaceholder)" } else { $ViewModel.SearchPlaceholder }
+                [void]$sb.Append($a.FgMuted + '  ' + $ph + $a.BgDark + $a.ClearLine + "`r`n")
+            } else {
+                $prefix = if ($ViewModel.Mode -eq 'Tabs') { '/ ' } else { '' }
+                $qDisp = Truncate-Text ($prefix + $ViewModel.SearchQuery) ($Width - 4)
+                [void]$sb.Append($a.FgBright + '  ' + $qDisp + $a.FgDim + '_' + $a.BgDark + $a.ClearLine + "`r`n")
+            }
+            [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        }
+
+        # Optional top scroll indicator
+        if ($rowCount -gt 0 -and $State.ScrollTop -gt 0) {
+            [void]$sb.Append($a.FgDim + "  $($g.ArrowUp) $($State.ScrollTop) more above" + $a.BgDark + $a.ClearLine + "`r`n")
+        }
+
+        # Rows
+        if ($rowCount -eq 0) {
+            [void]$sb.Append($a.FgMuted + '  No matching items' + $a.BgDark + $a.ClearLine + "`r`n")
+        } else {
+            for ($i = $State.ScrollTop; $i -le $endIdx; $i++) {
+                $r = $rows[$i]
+                $isSel = ($i -eq $State.CursorIndex)
+                $priText = (Truncate-Text $r.Primary ($col1W - 1)).PadRight($col1W)
+                $secText = if ($hasSec) { (Truncate-Text $r.Secondary ($col2W - 1)).PadRight($col2W) } else { '' }
+                $descText = if ($descMax -gt 0) { Truncate-Text $r.Description $descMax } else { '' }
+
+                if ($isSel) {
+                    $rightPart = ($secText + $descText).TrimEnd()
+                    [void]$sb.Append($a.SelPrimary + "$($g.Chevron) " + $priText)
+                    if (-not [string]::IsNullOrEmpty($rightPart)) {
+                        [void]$sb.Append($a.SelSecond + $rightPart)
+                    }
+                    [void]$sb.Append($a.SelFill + $a.ClearLine + $a.Reset + "`r`n")
+                } else {
+                    $priColor = if ($r.IsMuted) { $a.FgMuted } else { $a.FgBright }
+                    [void]$sb.Append($a.BgDark + '  ' + $priColor + $priText)
+                    if ($hasSec) {
+                        [void]$sb.Append($a.FgMuted + $secText)
+                    }
+                    if (-not [string]::IsNullOrEmpty($descText)) {
+                        [void]$sb.Append($a.FgMuted + $descText)
+                    }
+                    [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+                }
+
+                if ($r.DividerAfter) {
+                    $ruleW = [math]::Max(12, [math]::Min($col1W - 2, $Width - 4))
+                    [void]$sb.Append($a.FgDim + '  ' + ($g.Rule * $ruleW) + $a.BgDark + $a.ClearLine + "`r`n")
+                }
+            }
+        }
+
+        # Optional bottom scroll indicator
+        if ($rowCount -gt 0 -and $endIdx -lt ($rowCount - 1)) {
+            $rem = ($rowCount - 1) - $endIdx
+            [void]$sb.Append($a.FgDim + "  $($g.ArrowDn) $rem more below" + $a.BgDark + $a.ClearLine + "`r`n")
+        }
+
+        # Blank line + optional subtle notice + footer keybind hints
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        if (-not [string]::IsNullOrWhiteSpace($ViewModel.Notice)) {
+            [void]$sb.Append($a.FgWarn + '  ' + (Truncate-Text $ViewModel.Notice ($Width - 2)) + $a.BgDark + $a.ClearLine + "`r`n")
+        }
+
+        [void]$sb.Append($a.BgDark + '  ')
+        for ($h = 0; $h -lt $ViewModel.Hints.Count; $h++) {
+            $hint = $ViewModel.Hints[$h]
+            if ($h -gt 0) {
+                [void]$sb.Append($a.FgDim + " $($g.Dot) ")
+            }
+            [void]$sb.Append($a.KeyBold + $hint.Key + ' ' + $a.KeyLabel + $hint.Label)
+        }
+        [void]$sb.Append($a.BgDark + $a.ClearLine + $a.ClearBelow + $a.Reset)
+        [Console]::Write($sb.ToString())
+        return
+    }
+
+    # Graceful non-VT console fallback
+    try { [Console]::SetCursorPosition(0, 0) } catch {}
+    if ($FullClear) { try { Clear-Host } catch {} }
+    if ($ViewModel.Mode -eq 'Tabs') {
+        Write-Host ' ' -NoNewline
+        for ($t = 0; $t -lt $ViewModel.Tabs.Count; $t++) {
+            $tName = $ViewModel.Tabs[$t]
+            if ($t -gt 0) { Write-Host '  ' -NoNewline }
+            if ($t -eq $ViewModel.ActiveTabIndex -and -not $ViewModel.ShowSearch) {
+                Write-Host "[$tName]" -ForegroundColor White -NoNewline
+            } else {
+                Write-Host " $tName " -ForegroundColor DarkGray -NoNewline
+            }
+        }
+        Write-Host ''
+        Write-Host ''
+    } else {
+        Write-Host ('  ' + (Truncate-Text $ViewModel.Title ($Width - 2))).PadRight($Width) -ForegroundColor White
+        Write-Host ('  ' + (Truncate-Text $ViewModel.Subtitle ($Width - 2))).PadRight($Width) -ForegroundColor DarkGray
+        Write-Host ''.PadRight($Width)
+    }
+
+    if ($ViewModel.ShowSearch) {
+        $sLine = if ([string]::IsNullOrEmpty($ViewModel.SearchQuery)) { '  ' + $ViewModel.SearchPlaceholder } else { '  / ' + $ViewModel.SearchQuery }
+        Write-Host ($sLine.PadRight($Width)) -ForegroundColor $(if ([string]::IsNullOrEmpty($ViewModel.SearchQuery)) { 'DarkGray' } else { 'White' })
+        Write-Host ''.PadRight($Width)
+    }
+
+    if ($rowCount -eq 0) {
+        Write-Host ('  No matching items'.PadRight($Width)) -ForegroundColor DarkGray
+    } else {
+        for ($i = $State.ScrollTop; $i -le $endIdx; $i++) {
+            $r = $rows[$i]
+            $isSel = ($i -eq $State.CursorIndex)
+            $ptr = if ($isSel) { "$($g.Chevron) " } else { '  ' }
+            $priText = (Truncate-Text $r.Primary ($col1W - 1)).PadRight($col1W)
+            $secText = if ($hasSec) { (Truncate-Text $r.Secondary ($col2W - 1)).PadRight($col2W) } else { '' }
+            $descText = if ($descMax -gt 0) { Truncate-Text $r.Description $descMax } else { '' }
+            $line = ($ptr + $priText + $secText + $descText).PadRight($Width)
+            if ($line.Length -gt $Width) { $line = $line.Substring(0, $Width) }
+
+            if ($isSel) {
+                Write-Host $line -ForegroundColor Black -BackgroundColor Gray
+            } elseif ($r.IsMuted) {
+                Write-Host $line -ForegroundColor DarkGray
+            } else {
+                Write-Host $line -ForegroundColor White
+            }
+            if ($r.DividerAfter) {
+                Write-Host (('  ' + ($g.Rule * [math]::Max(12, $col1W - 2))).PadRight($Width)) -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    Write-Host ''.PadRight($Width)
+    $hintPairs = @($ViewModel.Hints | ForEach-Object { "$($_.Key) $($_.Label)" })
+    Write-Host (('  ' + ($hintPairs -join " $($g.Dot) ")).PadRight($Width)) -ForegroundColor Gray -NoNewline
 }
 
 function Show-OptionsMenu {
@@ -560,108 +1616,37 @@ function Show-OptionsMenu {
         }
     }
 
-    $cursorIdx = 0
-    $scrollTop = 0
-    $feedback = 'Use Up/Down arrows to navigate, Space/Enter to toggle, or press Enter on [ START SCAN ].'
+    $caps = Initialize-TuiConsole
+    $state = New-TuiMenuState
     $lastW = -1
     $lastH = -1
+    $lastSig = ''
 
     try {
         try { [Console]::CursorVisible = $false } catch {}
-        try { Clear-Host } catch {}
 
         while ($true) {
             $w = Get-ConsoleSafeWidth
-            $h = 30
-            try {
-                $ch = [Console]::WindowHeight
-                if ($ch -ge 14) { $h = $ch }
-            } catch {}
-
+            $h = Get-ConsoleSafeHeight
+            $sig = "$($state.View)|$($state.TabIndex)|$($state.SearchActive)|$($state.SearchQuery)"
+            $needClear = ($w -ne $lastW -or $h -ne $lastH) -or (-not $caps.UseVt -and $sig -ne $lastSig)
             if ($w -ne $lastW -or $h -ne $lastH) {
-                try { Clear-Host } catch {}
                 $lastW = $w
                 $lastH = $h
             }
+            $lastSig = $sig
 
-            try { [Console]::SetCursorPosition(0, 0) } catch {}
-
-            $entries = Get-MenuEntries -Config $Config
-            $selectedCount = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
-            $bar = '=' * $w
-            $sep = '-' * $w
-
-            # Header (4 lines) + Footer (4 lines) + Scroll hints (2 lines) = 10 reserved lines
-            $maxVisible = [math]::Max(5, $h - 10)
-            if ($cursorIdx -lt $scrollTop) { $scrollTop = $cursorIdx }
-            if ($cursorIdx -ge ($scrollTop + $maxVisible)) { $scrollTop = $cursorIdx - $maxVisible + 1 }
-            $maxScroll = [math]::Max(0, $entries.Count - $maxVisible)
-            if ($scrollTop -gt $maxScroll) { $scrollTop = $maxScroll }
-            $endIdx = [math]::Min($entries.Count - 1, $scrollTop + $maxVisible - 1)
-
-            Write-Host $bar -ForegroundColor DarkCyan
-            Write-Host (('  ' + (Truncate-Text "WINDOWS SCAN & FIX  |  Settings  [Preset: $($Config.Preset) | $selectedCount/15 Checks]" ($w - 2))).PadRight($w)) -ForegroundColor Cyan
-            Write-Host (('  ' + (Truncate-Text "PC: $env:COMPUTERNAME  |  $OSCaption" ($w - 2))).PadRight($w)) -ForegroundColor Gray
-            Write-Host $bar -ForegroundColor DarkCyan
-
-            $aboveHint = if ($scrollTop -gt 0) { '    ^ More items above (Up Arrow)' } else { '' }
-            Write-Host ($aboveHint.PadRight($w)) -ForegroundColor DarkGray
-
-            for ($i = $scrollTop; $i -le $endIdx; $i++) {
-                $item = $entries[$i]
-                $isSel = ($i -eq $cursorIdx)
-                $ptr = if ($isSel) { '>' } else { ' ' }
-
-                if ($null -eq $item.Checked) {
-                    $box = '   '
-                } elseif ([bool]$item.Checked) {
-                    $box = '[x]'
-                } else {
-                    $box = '[ ]'
-                }
-
-                $lblCol = $item.Label.PadRight(33)
-                $detMax = [math]::Max(8, $w - 44)
-                $detTxt = Truncate-Text $item.Detail $detMax
-                $rowStr = ("  $ptr $box $lblCol $detTxt").PadRight($w)
-                if ($rowStr.Length -gt $w) { $rowStr = $rowStr.Substring(0, $w) }
-
-                if ($isSel) {
-                    $bg = if ($item.Kind -eq 'Start') { 'DarkGreen' } elseif ($item.Kind -eq 'Exit') { 'DarkRed' } else { 'DarkCyan' }
-                    Write-Host $rowStr -ForegroundColor White -BackgroundColor $bg
-                } elseif ($item.Kind -eq 'Start') {
-                    Write-Host $rowStr -ForegroundColor Green
-                } elseif ($item.Kind -eq 'Exit') {
-                    Write-Host $rowStr -ForegroundColor DarkGray
-                } elseif ($null -ne $item.Checked -and -not [bool]$item.Checked) {
-                    Write-Host $rowStr -ForegroundColor DarkGray
-                } else {
-                    Write-Host $rowStr -ForegroundColor White
-                }
-            }
-
-            $belowHint = if ($endIdx -lt ($entries.Count - 1)) { '    v More items below (Down Arrow)' } else { '' }
-            Write-Host ($belowHint.PadRight($w)) -ForegroundColor DarkGray
-
-            Write-Host $sep -ForegroundColor DarkGray
-            $fbLine = if ([string]::IsNullOrWhiteSpace($feedback)) { '' } else { '  ' + (Truncate-Text $feedback ($w - 2)) }
-            Write-Host ($fbLine.PadRight($w)) -ForegroundColor Yellow
-            $helpLine = '  ' + (Truncate-Text 'Up/Down: Move | Space/Enter: Toggle | S: Start | F: Full | Q: Quick | A/N: All/None | Esc: Exit' ($w - 2))
-            Write-Host ($helpLine.PadRight($w)) -ForegroundColor Cyan -NoNewline
+            $vm = Get-TuiMenuViewModel -Config $Config -State $state
+            Render-TuiMenuFrame -ViewModel $vm -State $state -Width $w -Height $h -FullClear:$needClear
 
             $keyInfo = [Console]::ReadKey($true)
             $keyName = $keyInfo.Key.ToString()
             $keyChar = if ($keyInfo.KeyChar -eq [char]0) { '' } else { [string]$keyInfo.KeyChar }
+            $shift = (($keyInfo.Modifiers -band [ConsoleModifiers]::Shift) -ne 0)
 
-            $act = Invoke-MenuKeyAction -Config $Config -CursorIndex $cursorIdx -KeyName $keyName -KeyChar $keyChar
-            $cursorIdx = $act.CursorIndex
-            if (-not [string]::IsNullOrWhiteSpace($act.Feedback)) {
-                $feedback = $act.Feedback
-            } else {
-                $feedback = ''
-            }
-            if ($act.Action -eq 'Start') { return $Config }
-            if ($act.Action -eq 'Exit')  { return $null }
+            $action = Invoke-TuiMenuKey -Config $Config -State $state -KeyName $keyName -KeyChar $keyChar -ShiftPressed $shift
+            if ($action -eq 'Start') { return $Config }
+            if ($action -eq 'Exit')  { return $null }
         }
     } finally {
         try { [Console]::CursorVisible = $true } catch {}
@@ -683,24 +1668,29 @@ function New-ScanUiState {
             ShortName    = $s.ShortName
             State        = if ($isOn) { 'QUEUED' } else { 'SKIPPED' }
             DurationText = ''
-            SummaryLine  = if ($isOn) { 'Queued' } else { 'Skipped by user' }
+            SummaryLine  = if ($isOn) { 'Queued' } else { 'Skipped' }
         })
     }
 
     return [PSCustomObject]@{
-        Steps          = $rows
-        ScanStart      = $ScanStart
-        ActiveOrder    = 0
-        ActiveCommand  = ''
-        FixedCount     = 0
-        AttentionCount = 0
-        RawLogPath     = $RawLogPath
-        SpinIdx        = 0
-        TotalEnabled   = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
-        HeaderRow      = -1
-        HeaderPrefix   = ''
-        StatusRow      = -1
-        LastHeaderSec  = ''
+        Steps           = $rows
+        ScanStart       = $ScanStart
+        PresetLabel     = (Format-PresetLabel $Config.Preset)
+        ActiveOrder     = 0
+        ActiveCommand   = ''
+        FixedCount      = 0
+        AttentionCount  = 0
+        RawLogPath      = $RawLogPath
+        SpinIdx         = 0
+        TotalEnabled    = @($Config.Enabled.Values | Where-Object { $_ -eq $true }).Count
+        DoneCount       = 0
+        HeaderRow       = -1
+        ActiveRowLine   = -1
+        ActiveRowLabel  = ''
+        StatusRow       = -1
+        LastHeaderSec   = ''
+        LastWidth       = -1
+        LastHeight      = -1
     }
 }
 
@@ -711,71 +1701,169 @@ function Render-ScanDashboard {
         [switch]$NoClear
     )
 
+    $caps = Initialize-TuiConsole
+    $g = Get-TuiGlyphs
     $w = Get-ConsoleSafeWidth
-    $bar = '=' * $w
-    $sep = '-' * $w
+    $h = Get-ConsoleSafeHeight
 
     $doneCount = @($UiState.Steps | Where-Object { $_.State -in @('OK', 'FIXED', 'ATTENTION', 'PENDING', 'ERROR') }).Count
+    $UiState.DoneCount = $doneCount
     $totalEn = [math]::Max(1, [int]$UiState.TotalEnabled)
     $pct = [math]::Min(100, [int][math]::Floor(($doneCount * 100.0) / $totalEn))
     if ($Final) { $pct = 100 }
 
-    $barLen = 20
+    $barLen = [math]::Max(16, [math]::Min(36, $w - 20))
     $filled = [int][math]::Round(($pct / 100.0) * $barLen)
-    $progBar = ('#' * $filled) + ('-' * ($barLen - $filled))
     $elapsedStr = Format-ClockSpan ((Get-Date) - $UiState.ScanStart)
-    $headerPrefix = ("  WINDOWS SCAN & FIX   [$progBar] {0,3}%  ($doneCount/$totalEn)   Elapsed: " -f $pct)
+    $UiState.LastHeaderSec = $elapsedStr
 
-    if (-not $NoClear) {
-        try { [Console]::CursorVisible = (-not (-not $Final)) } catch {}
-        try { Clear-Host } catch {}
+    $needFullClear = ($UiState.LastWidth -ne $w -or $UiState.LastHeight -ne $h)
+    $UiState.LastWidth = $w
+    $UiState.LastHeight = $h
+
+    # Determine visible step window if terminal height is compact
+    $steps = $UiState.Steps
+    $startIdx = 0
+    $endIdx = $steps.Count - 1
+    $maxRows = [math]::Max(6, $h - 8)
+    if (-not $Final -and $steps.Count -gt $maxRows) {
+        $activeIdx = 0
+        for ($idx = 0; $idx -lt $steps.Count; $idx++) {
+            if ($steps[$idx].Order -eq $UiState.ActiveOrder) { $activeIdx = $idx; break }
+        }
+        $startIdx = [math]::Max(0, [math]::Min($steps.Count - $maxRows, $activeIdx - [int]($maxRows / 2)))
+        $endIdx = [math]::Min($steps.Count - 1, $startIdx + $maxRows - 1)
     }
 
-    Write-Host $bar -ForegroundColor DarkCyan
-    try { $UiState.HeaderRow = [Console]::CursorTop } catch { $UiState.HeaderRow = -1 }
-    $UiState.HeaderPrefix = $headerPrefix
-    $UiState.LastHeaderSec = $elapsedStr
-    Write-Host (($headerPrefix + $elapsedStr).PadRight($w)) -ForegroundColor Cyan
-    Write-Host ("  PC: $env:COMPUTERNAME  |  Fixed: $($UiState.FixedCount)  |  Alerts: $($UiState.AttentionCount)  |  Raw Log Saved Silently") -ForegroundColor Gray
-    Write-Host $bar -ForegroundColor DarkCyan
-    Write-Host ''
+    $nameColW = 30
+    $durColW = 7
+    $sumMax = [math]::Max(10, $w - (4 + 4 + $nameColW + 1 + $durColW + 2))
+    $spinChar = $g.Spinner[$UiState.SpinIdx % $g.Spinner.Count]
 
-    foreach ($row in $UiState.Steps) {
-        $badge = '[     ]'
-        $badgeColor = 'DarkGray'
-        $textColor = 'Gray'
-        switch ($row.State) {
-            'OK'        { $badge = '[ OK  ]'; $badgeColor = 'Green';    $textColor = 'White' }
-            'FIXED'     { $badge = '[FIX  ]'; $badgeColor = 'Cyan';     $textColor = 'White' }
-            'ATTENTION' { $badge = '[WARN ]'; $badgeColor = 'Yellow';   $textColor = 'Yellow' }
-            'PENDING'   { $badge = '[PEND ]'; $badgeColor = 'Magenta';  $textColor = 'White' }
-            'ERROR'     { $badge = '[ERR  ]'; $badgeColor = 'Red';      $textColor = 'Red' }
-            'SKIPPED'   { $badge = '[SKIP ]'; $badgeColor = 'DarkGray'; $textColor = 'DarkGray' }
-            'RUNNING'   { $badge = '[ >>> ]'; $badgeColor = 'White';    $textColor = 'Cyan' }
-            default     { $badge = '[     ]'; $badgeColor = 'DarkGray'; $textColor = 'DarkGray' }
+    $UiState.ActiveRowLine = -1
+    $UiState.ActiveRowLabel = ''
+
+    if ($caps.UseVt) {
+        $a = Get-TuiAnsi
+        if (-not $NoClear) {
+            try { [Console]::CursorVisible = [bool]$Final } catch {}
         }
 
-        $numStr = ('{0,2}' -f $row.Order)
-        $nameCol = $row.ShortName.PadRight(29)
-        $durCol = if ([string]::IsNullOrWhiteSpace($row.DurationText)) { '       ' } else { ('{0,6} ' -f $row.DurationText) }
-        $prefixLen = 2 + 7 + 2 + 4 + 29 + 1 + 7
-        $sumMax = [math]::Max(10, $w - $prefixLen)
-        $sumTxt = Truncate-Text $row.SummaryLine $sumMax
+        $sb = New-Object System.Text.StringBuilder
+        if (-not $NoClear) {
+            [void]$sb.Append($(if ($needFullClear) { $a.ClearAll } else { $a.Home }))
+        }
 
-        Write-Host '  ' -NoNewline
-        Write-Host $badge -ForegroundColor $badgeColor -NoNewline
-        Write-Host ("  $numStr. $nameCol ") -ForegroundColor $textColor -NoNewline
-        Write-Host $durCol -ForegroundColor DarkGray -NoNewline
-        Write-Host $sumTxt -ForegroundColor $(if ($row.State -eq 'RUNNING') { 'Cyan' } elseif ($row.State -eq 'ATTENTION') { 'Yellow' } elseif ($row.State -eq 'ERROR') { 'Red' } else { 'Gray' })
+        # Row 1: Title + right-aligned live timer & step count
+        $UiState.HeaderRow = 1
+        $titleLeft = 'Windows Scan & Fix'
+        $metaRight = "$elapsedStr $($g.Dot) $doneCount/$totalEn"
+        $titleGap = [math]::Max(2, $w - 2 - $titleLeft.Length - $metaRight.Length - 1)
+        [void]$sb.Append($a.FgBright + '  ' + $titleLeft + (' ' * $titleGap) + $a.FgMuted + $metaRight + $a.BgDark + $a.ClearLine + "`r`n")
+
+        # Row 2: Subtitle
+        $subText = "$($UiState.PresetLabel) $($g.Dot) $env:COMPUTERNAME $($g.Dot) $($UiState.FixedCount) fixed $($g.Dot) $($UiState.AttentionCount) alerts"
+        [void]$sb.Append($a.FgMuted + '  ' + (Truncate-Text $subText ($w - 2)) + $a.BgDark + $a.ClearLine + "`r`n")
+
+        # Row 3: Thin monochrome progress bar
+        $fillPart = $g.BarFill * $filled
+        $trackPart = $g.BarTrack * ($barLen - $filled)
+        $pctText = ('{0,3}%' -f $pct)
+        [void]$sb.Append($a.BgDark + '  ' + $a.FgBright + $fillPart + $a.FgDim + $trackPart + '  ' + $a.FgMuted + $pctText + $a.BgDark + $a.ClearLine + "`r`n")
+
+        # Row 4: Blank
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        $curLine = 5
+
+        for ($i = $startIdx; $i -le $endIdx; $i++) {
+            $row = $steps[$i]
+            $numStr = ('{0:00}' -f $row.Order)
+            $nameCol = (Truncate-Text $row.ShortName ($nameColW - 1)).PadRight($nameColW)
+            $durCol = if ([string]::IsNullOrWhiteSpace($row.DurationText)) { (' ' * $durColW) } else { ('{0,6} ' -f $row.DurationText) }
+            $sumTxt = Truncate-Text $row.SummaryLine $sumMax
+
+            if ($row.State -eq 'RUNNING') {
+                $UiState.ActiveRowLine = $curLine
+                $UiState.ActiveRowLabel = "$numStr. $nameCol"
+                [void]$sb.Append($a.SelPrimary + "$($g.Chevron) $spinChar $numStr. $nameCol")
+                [void]$sb.Append($a.SelSecond + "$durCol $sumTxt")
+                [void]$sb.Append($a.SelFill + $a.ClearLine + $a.Reset + "`r`n")
+            } else {
+                $glyph = $g.Queued
+                $glyphCol = $a.FgDim
+                $lblCol = $a.FgDim
+                $sumCol = $a.FgDim
+                switch ($row.State) {
+                    'OK'        { $glyph = $g.Check;   $glyphCol = $a.FgOk;      $lblCol = $a.FgText;   $sumCol = $a.FgMuted }
+                    'FIXED'     { $glyph = $g.Fixed;   $glyphCol = $a.FgFixed;   $lblCol = $a.FgBright; $sumCol = $a.FgMuted }
+                    'ATTENTION' { $glyph = $g.Warn;    $glyphCol = $a.FgWarn;    $lblCol = $a.FgBright; $sumCol = $a.FgWarn }
+                    'PENDING'   { $glyph = $g.Pending; $glyphCol = $a.FgPending; $lblCol = $a.FgText;   $sumCol = $a.FgMuted }
+                    'ERROR'     { $glyph = $g.Err;     $glyphCol = $a.FgErr;     $lblCol = $a.FgErr;    $sumCol = $a.FgErr }
+                    'SKIPPED'   { $glyph = $g.Skipped; $glyphCol = $a.FgDim;     $lblCol = $a.FgDim;    $sumCol = $a.FgDim }
+                    default     { $glyph = $g.Queued;  $glyphCol = $a.FgDim;     $lblCol = $a.FgDim;    $sumCol = $a.FgDim }
+                }
+                [void]$sb.Append($a.BgDark + '  ' + $glyphCol + $glyph + ' ' + $lblCol + "$numStr. $nameCol" + $a.FgDim + $durCol + ' ' + $sumCol + $sumTxt + $a.BgDark + $a.ClearLine + "`r`n")
+            }
+            $curLine++
+        }
+
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        $curLine++
+
+        if (-not $Final) {
+            $UiState.StatusRow = $curLine
+            $cmdHint = Truncate-Text ("Step $($UiState.ActiveOrder)/15 $($g.Dot) 00:00 $($g.Dot) $($UiState.ActiveCommand)") ($w - 5)
+            [void]$sb.Append($a.BgDark + '  ' + $a.FgBright + $spinChar + ' ' + $a.FgMuted + $cmdHint + $a.BgDark + $a.ClearLine + $a.ClearBelow + $a.Reset)
+        } else {
+            $UiState.StatusRow = -1
+            [void]$sb.Append($a.ClearBelow + $a.Reset)
+            try { [Console]::CursorVisible = $true } catch {}
+        }
+
+        [Console]::Write($sb.ToString())
+        return
     }
 
-    Write-Host ''
-    Write-Host $sep -ForegroundColor DarkGray
+    # Graceful non-VT console fallback
+    if (-not $NoClear) {
+        try { [Console]::CursorVisible = [bool]$Final } catch {}
+        try { if ($needFullClear) { Clear-Host } else { [Console]::SetCursorPosition(0, 0) } } catch {}
+    }
+
+    try { $UiState.HeaderRow = [Console]::CursorTop } catch { $UiState.HeaderRow = -1 }
+    $titleLeft = 'Windows Scan & Fix'
+    $metaRight = "$elapsedStr $($g.Dot) $doneCount/$totalEn"
+    $titleGap = [math]::Max(2, $w - 2 - $titleLeft.Length - $metaRight.Length - 1)
+    Write-Host (('  ' + $titleLeft + (' ' * $titleGap) + $metaRight).PadRight($w)) -ForegroundColor White
+    $subText = "$($UiState.PresetLabel) $($g.Dot) $env:COMPUTERNAME $($g.Dot) $($UiState.FixedCount) fixed $($g.Dot) $($UiState.AttentionCount) alerts"
+    Write-Host (('  ' + (Truncate-Text $subText ($w - 2))).PadRight($w)) -ForegroundColor DarkGray
+    Write-Host (('  ' + ($g.BarFill * $filled) + ($g.BarTrack * ($barLen - $filled)) + ('  {0,3}%' -f $pct)).PadRight($w)) -ForegroundColor Gray
+    Write-Host ''.PadRight($w)
+
+    for ($i = $startIdx; $i -le $endIdx; $i++) {
+        $row = $steps[$i]
+        $numStr = ('{0:00}' -f $row.Order)
+        $nameCol = (Truncate-Text $row.ShortName ($nameColW - 1)).PadRight($nameColW)
+        $durCol = if ([string]::IsNullOrWhiteSpace($row.DurationText)) { (' ' * $durColW) } else { ('{0,6} ' -f $row.DurationText) }
+        $sumTxt = Truncate-Text $row.SummaryLine $sumMax
+        if ($row.State -eq 'RUNNING') {
+            $line = ("$($g.Chevron) $spinChar $numStr. $nameCol$durCol $sumTxt").PadRight($w)
+            if ($line.Length -gt $w) { $line = $line.Substring(0, $w) }
+            Write-Host $line -ForegroundColor Black -BackgroundColor Gray
+        } else {
+            $glyph = switch ($row.State) { 'OK' { $g.Check } 'FIXED' { $g.Fixed } 'ATTENTION' { $g.Warn } 'ERROR' { $g.Err } 'PENDING' { $g.Pending } 'SKIPPED' { $g.Skipped } default { $g.Queued } }
+            $fg = switch ($row.State) { 'OK' { 'Gray' } 'FIXED' { 'White' } 'ATTENTION' { 'Yellow' } 'ERROR' { 'Red' } 'PENDING' { 'Gray' } default { 'DarkGray' } }
+            $line = ("  $glyph $numStr. $nameCol$durCol $sumTxt").PadRight($w)
+            if ($line.Length -gt $w) { $line = $line.Substring(0, $w) }
+            Write-Host $line -ForegroundColor $fg
+        }
+    }
+
+    Write-Host ''.PadRight($w)
     if (-not $Final) {
-        $actTxt = '  ' + (Truncate-Text ("ACTIVE: [$($UiState.ActiveOrder)/15] $($UiState.ActiveCommand)") ($w - 2))
-        Write-Host $actTxt -ForegroundColor Cyan
         try { $UiState.StatusRow = [Console]::CursorTop } catch { $UiState.StatusRow = -1 }
-        Write-Host '  STATUS: [|] Starting...' -ForegroundColor Gray -NoNewline
+        $cmdHint = '  ' + $spinChar + ' ' + (Truncate-Text ("Step $($UiState.ActiveOrder)/15 $($g.Dot) 00:00 $($g.Dot) $($UiState.ActiveCommand)") ($w - 5))
+        Write-Host ($cmdHint.PadRight($w)) -ForegroundColor Gray -NoNewline
     } else {
         $UiState.StatusRow = -1
         try { [Console]::CursorVisible = $true } catch {}
@@ -789,31 +1877,49 @@ function Update-ActiveStatusLine {
         [string]$Hint = ''
     )
 
-    $frames = @('|', '/', '-', '\')
-    $UiState.SpinIdx = ($UiState.SpinIdx + 1) % $frames.Count
-    $spin = $frames[$UiState.SpinIdx]
+    $caps = Initialize-TuiConsole
+    $g = Get-TuiGlyphs
+    $UiState.SpinIdx = ($UiState.SpinIdx + 1) % $g.Spinner.Count
+    $spin = $g.Spinner[$UiState.SpinIdx]
     $stepClock = Format-ClockSpan ((Get-Date) - $StepStart)
     $totalClock = Format-ClockSpan ((Get-Date) - $UiState.ScanStart)
     $w = Get-ConsoleSafeWidth
+    $detail = if ([string]::IsNullOrWhiteSpace($Hint)) { $UiState.ActiveCommand } else { $Hint }
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'Working...' }
 
-    # Keep top header Elapsed timer ticking live every second
-    if ($totalClock -ne $UiState.LastHeaderSec -and $UiState.HeaderRow -ge 0 -and -not [string]::IsNullOrEmpty($UiState.HeaderPrefix)) {
-        $UiState.LastHeaderSec = $totalClock
-        try {
-            $oldFg = [Console]::ForegroundColor
-            [Console]::SetCursorPosition(0, $UiState.HeaderRow)
-            [Console]::ForegroundColor = [ConsoleColor]::Cyan
-            $hdrFull = $UiState.HeaderPrefix + $totalClock
-            if ($hdrFull.Length -gt $w) { $hdrFull = $hdrFull.Substring(0, $w) }
-            [Console]::Write($hdrFull.PadRight($w))
-            [Console]::ForegroundColor = $oldFg
-        } catch {
-            # Ignore non-interactive cursor errors
+    if ($caps.UseVt) {
+        $e = [char]0x1B
+        $a = Get-TuiAnsi
+        $sb = New-Object System.Text.StringBuilder
+
+        # Update top-right elapsed timer live every second
+        if ($totalClock -ne $UiState.LastHeaderSec -and $UiState.HeaderRow -gt 0) {
+            $UiState.LastHeaderSec = $totalClock
+            $titleLeft = 'Windows Scan & Fix'
+            $totalEn = [math]::Max(1, [int]$UiState.TotalEnabled)
+            $metaRight = "$totalClock $($g.Dot) $($UiState.DoneCount)/$totalEn"
+            $titleGap = [math]::Max(2, $w - 2 - $titleLeft.Length - $metaRight.Length - 1)
+            [void]$sb.Append("${e}[$($UiState.HeaderRow);1H" + $a.FgBright + '  ' + $titleLeft + (' ' * $titleGap) + $a.FgMuted + $metaRight + $a.BgDark + $a.ClearLine)
         }
+
+        # Animate spinner inside the inverted active step row
+        if ($UiState.ActiveRowLine -gt 0 -and -not [string]::IsNullOrEmpty($UiState.ActiveRowLabel)) {
+            [void]$sb.Append("${e}[$($UiState.ActiveRowLine);1H" + $a.SelPrimary + "$($g.Chevron) $spin ")
+        }
+
+        # Update live footer status line
+        if ($UiState.StatusRow -gt 0) {
+            $statusTxt = Truncate-Text ("Step $($UiState.ActiveOrder)/15 $($g.Dot) $stepClock $($g.Dot) $detail") ($w - 5)
+            [void]$sb.Append("${e}[$($UiState.StatusRow);1H" + $a.BgDark + '  ' + $a.FgBright + $spin + ' ' + $a.FgMuted + $statusTxt + $a.BgDark + $a.ClearLine)
+        }
+
+        [void]$sb.Append($a.Reset)
+        try { [Console]::Write($sb.ToString()) } catch {}
+        return
     }
 
-    $detail = if ([string]::IsNullOrWhiteSpace($Hint)) { 'Working... (raw output captured to log)' } else { $Hint }
-    $line = '  ' + (Truncate-Text "STATUS: [$spin] Step $stepClock | Total $totalClock | $detail" ($w - 2))
+    # Non-VT fallback
+    $line = '  ' + $spin + ' ' + (Truncate-Text ("Step $($UiState.ActiveOrder)/15 $($g.Dot) $stepClock $($g.Dot) $detail") ($w - 5))
     $padded = $line.PadRight($w)
     try {
         if ($UiState.StatusRow -ge 0) {
@@ -822,9 +1928,7 @@ function Update-ActiveStatusLine {
         } else {
             [Console]::Write("`r" + $padded)
         }
-    } catch {
-        # Ignore non-interactive console write errors
-    }
+    } catch {}
 }
 
 function New-ScanHtmlReport {
@@ -1378,8 +2482,10 @@ function Invoke-WindowsScanAndFix {
     $config = New-DefaultScanConfig
     $config = Show-OptionsMenu -Config $config -OSCaption $osCaption
     if ($null -eq $config) {
+        Reset-TuiConsole
+        try { Clear-Host } catch {}
         Write-Host ''
-        Write-Host '  Scan cancelled. Nothing was modified.' -ForegroundColor Gray
+        Write-Host '  Scan cancelled. Nothing was modified.' -ForegroundColor DarkGray
         exit 0
     }
 
@@ -3092,69 +4198,176 @@ public static class ScanExecutionState {
         }
     }
 
-    # Final polished dashboard + concise findings
+    # Final polished dashboard + concise monochrome findings
     Render-ScanDashboard -UiState $ui -Final
 
-    Write-Host "  SCAN COMPLETE  |  Total Duration: $totalDuration" -ForegroundColor Green
-    Write-Host ''
-    Write-Host '  WHAT WAS FIXED:' -ForegroundColor Cyan
-    if ($fixedItems.Count -eq 0) {
-        Write-Host '    (No automatic repairs were needed)' -ForegroundColor Gray
-    } else {
-        foreach ($fi in $fixedItems) {
-            Write-Host "    [FIX]  $($fi.Source): $($fi.Description)" -ForegroundColor Green
-        }
-    }
-    Write-Host ''
-    Write-Host '  THINGS YOU MAY NEED TO LOOK AT:' -ForegroundColor Yellow
-    if ($attentionItems.Count -eq 0) {
-        Write-Host '    (Nothing needs your attention right now)' -ForegroundColor Gray
-    } else {
-        $sortedAttn = @($attentionItems | Sort-Object { switch ([string]$_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } })
-        foreach ($ai in $sortedAttn) {
-            $aiColor = switch ([string]$ai.Severity) { 'High' { 'Red' } 'Medium' { 'Yellow' } default { 'Cyan' } }
-            Write-Host "    [$($ai.Severity)] $($ai.Source): $($ai.Title)" -ForegroundColor $aiColor
-        }
-    }
-    if ($maintenanceItems.Count -gt 0) {
-        Write-Host ''
-        Write-Host '  ROUTINE MAINTENANCE:' -ForegroundColor DarkCyan
-        foreach ($mi in $maintenanceItems) {
-            Write-Host "    [MAINT] $($mi.Source): $($mi.Description)" -ForegroundColor Gray
-        }
-    }
-    Write-Host ''
-    Write-Host "  Report : $desktopReportPath" -ForegroundColor White
-    Write-Host "  Raw Log: $rawLogPath" -ForegroundColor DarkGray
-    Write-Host ''
+    $caps = Initialize-TuiConsole
+    $g = Get-TuiGlyphs
+    $w = Get-ConsoleSafeWidth
 
-    if ($config.AutoRestart) {
-        if ($config.OpenReport) {
-            Write-Host '  After restart, your updated report (with RAM test results) will open automatically.' -ForegroundColor Gray
+    if ($caps.UseVt) {
+        $a = Get-TuiAnsi
+        $sb = New-Object System.Text.StringBuilder
+        $ruleW = [math]::Max(18, [math]::Min(36, $w - 4))
+        [void]$sb.Append($a.FgDim + '  ' + ($g.Rule * $ruleW) + $a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.FgBright + '  Scan complete' + $a.FgMuted + "  $($g.Dot)  Total duration: $totalDuration" + $a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+
+        [void]$sb.Append($a.FgBright + '  Fixed' + $a.BgDark + $a.ClearLine + "`r`n")
+        if ($fixedItems.Count -eq 0) {
+            [void]$sb.Append($a.FgMuted + '    No automatic repairs were needed' + $a.BgDark + $a.ClearLine + "`r`n")
+        } else {
+            foreach ($fi in $fixedItems) {
+                [void]$sb.Append($a.BgDark + '    ' + $a.FgFixed + $g.Fixed + ' ' + $a.FgText + "$($fi.Source): " + $a.FgMuted + $fi.Description + $a.BgDark + $a.ClearLine + "`r`n")
+            }
         }
-        Write-Host "  Restarting in $($config.RestartDelaySec) seconds... Close this window or press Ctrl+C to cancel." -ForegroundColor Magenta
-        for ($sec = [int]$config.RestartDelaySec; $sec -gt 0; $sec--) {
-            Write-Host -NoNewline ("`r  Restarting in {0,2}s...   " -f $sec) -ForegroundColor Magenta
-            Start-Sleep -Seconds 1
+
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.FgBright + '  Needs attention' + $a.BgDark + $a.ClearLine + "`r`n")
+        if ($attentionItems.Count -eq 0) {
+            [void]$sb.Append($a.FgMuted + '    Nothing requires your attention right now' + $a.BgDark + $a.ClearLine + "`r`n")
+        } else {
+            $sortedAttn = @($attentionItems | Sort-Object { switch ([string]$_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } })
+            foreach ($ai in $sortedAttn) {
+                $sevCol = switch ([string]$ai.Severity) { 'High' { $a.FgErr } 'Medium' { $a.FgWarn } default { $a.FgMuted } }
+                [void]$sb.Append($a.BgDark + '    ' + $sevCol + "[$($ai.Severity)] " + $a.FgText + "$($ai.Source): " + $a.FgMuted + $ai.Title + $a.BgDark + $a.ClearLine + "`r`n")
+            }
+        }
+
+        if ($maintenanceItems.Count -gt 0) {
+            [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+            [void]$sb.Append($a.FgBright + '  Maintenance' + $a.BgDark + $a.ClearLine + "`r`n")
+            foreach ($mi in $maintenanceItems) {
+                [void]$sb.Append($a.BgDark + '    ' + $a.FgDim + $g.Dot + ' ' + $a.FgText + "$($mi.Source): " + $a.FgMuted + $mi.Description + $a.BgDark + $a.ClearLine + "`r`n")
+            }
+        }
+
+        [void]$sb.Append($a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.FgMuted + '  Report   ' + $a.FgText + $desktopReportPath + $a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.FgMuted + '  Raw log  ' + $a.FgDim + $rawLogPath + $a.BgDark + $a.ClearLine + "`r`n")
+        [void]$sb.Append($a.BgDark + $a.ClearLine + $a.Reset + "`r`n")
+        [Console]::Write($sb.ToString())
+    } else {
+        Write-Host ('  ' + ($g.Rule * [math]::Max(18, [math]::Min(36, $w - 4)))) -ForegroundColor DarkGray
+        Write-Host "  Scan complete  $($g.Dot)  Total duration: $totalDuration" -ForegroundColor White
+        Write-Host ''
+        Write-Host '  Fixed' -ForegroundColor White
+        if ($fixedItems.Count -eq 0) {
+            Write-Host '    No automatic repairs were needed' -ForegroundColor DarkGray
+        } else {
+            foreach ($fi in $fixedItems) {
+                Write-Host "    + $($fi.Source): $($fi.Description)" -ForegroundColor Gray
+            }
         }
         Write-Host ''
-        & "$sysDir\shutdown.exe" /r /t 5 /d p:2:2 /c "Windows Scan and Fix complete. Restarting your computer now..."
-        return
-    } else {
+        Write-Host '  Needs attention' -ForegroundColor White
+        if ($attentionItems.Count -eq 0) {
+            Write-Host '    Nothing requires your attention right now' -ForegroundColor DarkGray
+        } else {
+            $sortedAttn = @($attentionItems | Sort-Object { switch ([string]$_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } })
+            foreach ($ai in $sortedAttn) {
+                $aiColor = switch ([string]$ai.Severity) { 'High' { 'Red' } 'Medium' { 'Yellow' } default { 'Gray' } }
+                Write-Host "    [$($ai.Severity)] $($ai.Source): $($ai.Title)" -ForegroundColor $aiColor
+            }
+        }
+        if ($maintenanceItems.Count -gt 0) {
+            Write-Host ''
+            Write-Host '  Maintenance' -ForegroundColor White
+            foreach ($mi in $maintenanceItems) {
+                Write-Host "    $($g.Dot) $($mi.Source): $($mi.Description)" -ForegroundColor Gray
+            }
+        }
+        Write-Host ''
+        Write-Host "  Report   $desktopReportPath" -ForegroundColor Gray
+        Write-Host "  Raw log  $rawLogPath" -ForegroundColor DarkGray
+        Write-Host ''
+    }
+
+    $doRestart = [bool]$config.AutoRestart
+    if ($doRestart) {
+        if ($config.OpenReport) {
+            Write-Host '  After restart, your updated report (with RAM test results) will open automatically.' -ForegroundColor DarkGray
+        }
+        $restartCancelled = $false
+        $restartNow = $false
+        $deadline = (Get-Date).AddSeconds([int]$config.RestartDelaySec)
+        $lastShownSec = -1
+        $canReadKeys = $true
+        try { if ([Console]::IsInputRedirected) { $canReadKeys = $false } } catch { $canReadKeys = $false }
+
+        while ((Get-Date) -lt $deadline) {
+            $remSec = [int][math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+            if ($remSec -lt 0) { $remSec = 0 }
+            if ($remSec -ne $lastShownSec) {
+                $lastShownSec = $remSec
+                if ($caps.UseVt) {
+                    $a = Get-TuiAnsi
+                    [Console]::Write("`r" + $a.BgDark + '  ' + $a.FgBright + ("Restarting in {0,2}s" -f $remSec) + $a.FgDim + " $($g.Dot) " + $a.KeyBold + 'esc ' + $a.KeyLabel + 'cancel' + $a.FgDim + " $($g.Dot) " + $a.KeyBold + 'enter ' + $a.KeyLabel + 'restart now' + $a.BgDark + $a.ClearLine + $a.Reset)
+                } else {
+                    Write-Host -NoNewline ("`r  Restarting in {0,2}s  (Esc: cancel | Enter: restart now)   " -f $remSec) -ForegroundColor Gray
+                }
+            }
+            if ($canReadKeys) {
+                try {
+                    if ([Console]::KeyAvailable) {
+                        $ck = [Console]::ReadKey($true)
+                        $ckName = $ck.Key.ToString()
+                        $ckChar = if ($ck.KeyChar -eq [char]0) { '' } else { ([string]$ck.KeyChar).ToUpperInvariant() }
+                        if ($ckName -eq 'Escape' -or $ckChar -eq 'C') {
+                            $restartCancelled = $true
+                            break
+                        }
+                        if ($ckName -eq 'Enter') {
+                            $restartNow = $true
+                            break
+                        }
+                    }
+                } catch {}
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        Write-Host ''
+
+        if (-not $restartCancelled) {
+            & "$sysDir\shutdown.exe" /r /t 5 /d p:2:2 /c "Windows Scan and Fix complete. Restarting your computer now..."
+            return
+        }
+
+        Write-Host '  Automatic restart cancelled.' -ForegroundColor Gray
+        $doRestart = $false
+    }
+
+    if (-not $doRestart) {
         if ($config.OpenReport) {
             $openTarget = if (Test-Path -LiteralPath $desktopReportPath) { $desktopReportPath } else { $archiveReportPath }
             try { Start-Process -FilePath $openTarget } catch {}
         }
         if ($memDiagScheduled -or $offlineChkdskScheduled) {
-            Write-Host '  NOTE: Boot-time tests (Memory Diagnostic / CHKDSK) will run on your next manual restart.' -ForegroundColor Yellow
+            Write-Host '  Note: Boot-time tests (Memory Diagnostic / CHKDSK) will run on your next manual restart.' -ForegroundColor Yellow
         }
-        Write-Host '  Done! Press Enter to close this window.' -ForegroundColor Cyan
-        [void](Read-Host)
+        Write-Host ''
+        if ($caps.UseVt) {
+            $a = Get-TuiAnsi
+            [Console]::Write($a.BgDark + '  ' + $a.KeyBold + 'enter ' + $a.KeyLabel + 'close' + $a.BgDark + $a.ClearLine + $a.Reset)
+        } else {
+            Write-Host '  enter close' -ForegroundColor Gray -NoNewline
+        }
+        $canReadKeys = $true
+        try { if ([Console]::IsInputRedirected) { $canReadKeys = $false } } catch { $canReadKeys = $false }
+        if ($canReadKeys) {
+            while ($true) {
+                $k = [Console]::ReadKey($true)
+                if ($k.Key -eq [ConsoleKey]::Enter -or $k.Key -eq [ConsoleKey]::Escape) { break }
+            }
+        } else {
+            [void](Read-Host)
+        }
+        Write-Host ''
         return
     }
     } finally {
         try { [void][ScanExecutionState]::SetThreadExecutionState([ScanExecutionState]::Continuous) } catch {}
-        try { [Console]::CursorVisible = $true } catch {}
+        Reset-TuiConsole
     }
 }
 
