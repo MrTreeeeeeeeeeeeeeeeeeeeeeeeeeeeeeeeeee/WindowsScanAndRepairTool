@@ -137,6 +137,37 @@ function Truncate-Text {
     return $clean.Substring(0, $MaxLen - 3) + '...'
 }
 
+function Format-CleanToolOutput {
+    param([AllowEmptyString()][string]$Text)
+    $Text = $Text -replace '[^\r\n]*\r(?!\n)', ''
+    $Text = $Text -replace '(?m)^[ \t]*\[[= \t\d.%]+\][ \t]*\r?$', ''
+    return ($Text -replace '(?m)^(?:[ \t]*\r?\n){2,}', [Environment]::NewLine).Trim()
+}
+
+function Get-EnergyReportErrors {
+    param([string]$Html)
+    $pattern = '(?is)<div\s+class="\s*error-log-entry\s*"\s*>(.*?)(?=<div\s+class="\s*log-entry\s*"|$)'
+    foreach ($entry in [regex]::Matches($Html, $pattern)) {
+        $lines = @(foreach ($part in [regex]::Matches($entry.Groups[1].Value, '(?is)<div\s+class="log-entry-(?:header|description)"\s*>(.*?)</div>|<tr\b[^>]*>(.*?)</tr>')) {
+            $value = $part.Groups[1].Value + $part.Groups[2].Value
+            $clean = [Net.WebUtility]::HtmlDecode(($value -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim())
+            if (-not [string]::IsNullOrWhiteSpace($clean)) { $clean }
+        })
+        if ($lines.Count -gt 0) {
+            $title = $lines[0]
+            if ($title.EndsWith(':')) {
+                $detailSuffix = if ($lines.Count -ge 3) { $lines[2] -replace '^Device Name\s+', '' } elseif ($lines.Count -ge 2) { $lines[1] } else { '' }
+                if (-not [string]::IsNullOrWhiteSpace($detailSuffix)) {
+                    $title = $title.TrimEnd(':') + ': ' + $detailSuffix
+                } else {
+                    $title = $title.TrimEnd(':')
+                }
+            }
+            [PSCustomObject]@{ Title=$title; Text=($lines -join ' | ') }
+        }
+    }
+}
+
 function Invoke-ConsoleTool {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -820,6 +851,18 @@ function New-ScanHtmlReport {
         }
     }
 
+    function Get-CardAccentClass {
+        param([string]$Status)
+        switch ($Status) {
+            'OK'        { return 'accent-ok' }
+            'FIXED'     { return 'accent-fixed' }
+            'ATTENTION' { return 'accent-warn' }
+            'PENDING'   { return 'accent-pending' }
+            'ERROR'     { return 'accent-err' }
+            default     { return 'accent-skip' }
+        }
+    }
+
     function Get-SeverityClass {
         param([string]$Severity)
         switch ($Severity) {
@@ -829,27 +872,45 @@ function New-ScanHtmlReport {
         }
     }
 
+    function Get-SeverityRank {
+        param([string]$Severity)
+        switch ($Severity) {
+            'High'   { return 0 }
+            'Medium' { return 1 }
+            default  { return 2 }
+        }
+    }
+
     $fixedItems = @(Get-SafeProp $State 'FixedItems' @() | Where-Object { $null -ne $_ })
-    $attentionItems = @(Get-SafeProp $State 'AttentionItems' @() | Where-Object { $null -ne $_ })
+    $maintItems = @(Get-SafeProp $State 'MaintenanceItems' @() | Where-Object { $null -ne $_ })
+    $rawAttention = @(Get-SafeProp $State 'AttentionItems' @() | Where-Object { $null -ne $_ })
+    $attentionItems = @($rawAttention | Sort-Object { Get-SeverityRank ([string](Get-SafeProp $_ 'Severity' 'Info')) })
     $results = @(Get-SafeProp $State 'Results' @() | Where-Object { $null -ne $_ } | Sort-Object { [int](Get-SafeProp $_ 'Order' 99) })
 
     $okCount = @($results | Where-Object { (Get-SafeProp $_ 'Status' '') -eq 'OK' }).Count
-    $runCount = @($results | Where-Object { (Get-SafeProp $_ 'Status' '') -ne 'SKIPPED' }).Count
+    $fixedCardCount = @($results | Where-Object { (Get-SafeProp $_ 'Status' '') -eq 'FIXED' }).Count
+    $skippedCount = @($results | Where-Object { (Get-SafeProp $_ 'Status' '') -eq 'SKIPPED' }).Count
+    $runCount = $results.Count - $skippedCount
     $fixedCount = $fixedItems.Count
+    $maintCount = $maintItems.Count
     $attentionCount = $attentionItems.Count
     $totalCount = $results.Count
 
     $highCount = @($attentionItems | Where-Object { (Get-SafeProp $_ 'Severity' '') -eq 'High' }).Count
     $pendingCount = @($results | Where-Object { (Get-SafeProp $_ 'Status' '') -eq 'PENDING' }).Count
 
-    if ($highCount -gt 0 -or $attentionCount -gt 0) {
-        $overallLabel = 'ACTION RECOMMENDED'
+    if ($highCount -gt 0) {
+        $overallLabel = 'ACTION NEEDED'
+        $overallClass = 'overall-err'
+        $overallDesc = "$highCount high-priority alert(s) and $attentionCount total item(s) require your review below."
+    } elseif ($attentionCount -gt 0) {
+        $overallLabel = 'REVIEW RECOMMENDED'
         $overallClass = 'overall-warn'
-        $overallDesc = "$attentionCount item(s) need your review below."
+        $overallDesc = "$attentionCount item(s) flagged for your review below."
     } elseif ($pendingCount -gt 0) {
         $overallLabel = 'RESTART PENDING'
         $overallClass = 'overall-pending'
-        $overallDesc = 'Pre-restart checks finished; Memory Diagnostic will finish during restart.'
+        $overallDesc = 'Pre-restart checks finished; Memory Diagnostic will complete during restart.'
     } elseif ($fixedCount -gt 0) {
         $overallLabel = 'ISSUES FIXED'
         $overallClass = 'overall-fixed'
@@ -880,38 +941,56 @@ function New-ScanHtmlReport {
     [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
     [void]$sb.AppendLine("<title>Windows Scan &amp; Fix Report - $computerName</title>")
     [void]$sb.AppendLine('<style>')
-    [void]$sb.AppendLine('  :root { --bg:#f4f6f9; --card:#ffffff; --text:#1e293b; --muted:#64748b; --border:#e2e8f0; --ok:#15803d; --ok-bg:#dcfce7; --fixed:#0369a1; --fixed-bg:#e0f2fe; --warn:#b45309; --warn-bg:#fef3c7; --err:#b91c1c; --err-bg:#fee2e2; --pend:#6d28d9; --pend-bg:#ede9fe; }')
+    [void]$sb.AppendLine('  :root { --bg:#f1f5f9; --card:#ffffff; --text:#0f172a; --muted:#64748b; --border:#e2e8f0; --ok:#15803d; --ok-bg:#dcfce7; --fixed:#0369a1; --fixed-bg:#e0f2fe; --warn:#b45309; --warn-bg:#fef3c7; --err:#b91c1c; --err-bg:#fee2e2; --pend:#6d28d9; --pend-bg:#ede9fe; --maint:#475569; --maint-bg:#f1f5f9; }')
     [void]$sb.AppendLine('  * { box-sizing:border-box; }')
-    [void]$sb.AppendLine('  body { margin:0; padding:24px; font-family:"Segoe UI",system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }')
+    [void]$sb.AppendLine('  body { margin:0; padding:24px 18px 40px; font-family:"Segoe UI",system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); line-height:1.55; }')
     [void]$sb.AppendLine('  .wrap { max-width:980px; margin:0 auto; }')
-    [void]$sb.AppendLine('  .hero { background:#0f172a; color:#f8fafc; border-radius:12px; padding:24px 28px; margin-bottom:20px; box-shadow:0 4px 14px rgba(15,23,42,0.12); }')
+    [void]$sb.AppendLine('  .hero { background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%); color:#f8fafc; border-radius:14px; padding:26px 28px; margin-bottom:18px; box-shadow:0 6px 20px rgba(15,23,42,0.16); }')
     [void]$sb.AppendLine('  .hero-top { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-start; gap:16px; }')
-    [void]$sb.AppendLine('  .hero h1 { margin:0 0 6px 0; font-size:24px; font-weight:700; }')
-    [void]$sb.AppendLine('  .hero-meta { color:#cbd5e1; font-size:13px; }')
-    [void]$sb.AppendLine('  .overall-pill { padding:8px 14px; border-radius:999px; font-size:13px; font-weight:700; letter-spacing:0.04em; white-space:nowrap; }')
+    [void]$sb.AppendLine('  .hero h1 { margin:0 0 8px 0; font-size:24px; font-weight:700; letter-spacing:-0.01em; }')
+    [void]$sb.AppendLine('  .meta-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; }')
+    [void]$sb.AppendLine('  .meta-chip { background:rgba(255,255,255,0.09); border:1px solid rgba(255,255,255,0.12); color:#e2e8f0; font-size:12px; padding:3px 10px; border-radius:999px; }')
+    [void]$sb.AppendLine('  .overall-pill { padding:8px 16px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:0.06em; white-space:nowrap; }')
     [void]$sb.AppendLine('  .overall-ok { background:#16a34a; color:#ffffff; }')
     [void]$sb.AppendLine('  .overall-fixed { background:#0284c7; color:#ffffff; }')
     [void]$sb.AppendLine('  .overall-warn { background:#d97706; color:#ffffff; }')
+    [void]$sb.AppendLine('  .overall-err { background:#dc2626; color:#ffffff; }')
     [void]$sb.AppendLine('  .overall-pending { background:#7c3aed; color:#ffffff; }')
-    [void]$sb.AppendLine('  .hero-sub { margin-top:12px; font-size:14px; color:#e2e8f0; }')
-    [void]$sb.AppendLine('  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:20px; }')
-    [void]$sb.AppendLine('  .kpi { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }')
+    [void]$sb.AppendLine('  .hero-sub { margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.12); font-size:14px; color:#e2e8f0; }')
+    [void]$sb.AppendLine('  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:20px; }')
+    [void]$sb.AppendLine('  .kpi { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:0 1px 3px rgba(15,23,42,0.04); }')
     [void]$sb.AppendLine('  .kpi-num { font-size:26px; font-weight:700; line-height:1.1; }')
-    [void]$sb.AppendLine('  .kpi-lbl { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; margin-top:4px; }')
-    [void]$sb.AppendLine('  .section { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px 22px; margin-bottom:18px; }')
-    [void]$sb.AppendLine('  .section h2 { margin:0 0 12px 0; font-size:18px; border-bottom:1px solid var(--border); padding-bottom:8px; }')
-    [void]$sb.AppendLine('  .empty-note { color:var(--muted); font-size:14px; margin:4px 0; }')
+    [void]$sb.AppendLine('  .kpi-lbl { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:4px; font-weight:600; }')
+    [void]$sb.AppendLine('  .kpi-sub { font-size:12px; color:var(--muted); margin-top:2px; }')
+    [void]$sb.AppendLine('  .section { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px 22px; margin-bottom:18px; box-shadow:0 1px 3px rgba(15,23,42,0.04); }')
+    [void]$sb.AppendLine('  .sec-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; border-bottom:1px solid var(--border); padding-bottom:10px; margin-bottom:14px; }')
+    [void]$sb.AppendLine('  .sec-head h2 { margin:0; font-size:17px; font-weight:700; }')
+    [void]$sb.AppendLine('  .btn-toggle { border:1px solid var(--border); background:#f8fafc; color:#334155; font-size:12px; font-weight:600; padding:5px 11px; border-radius:6px; cursor:pointer; }')
+    [void]$sb.AppendLine('  .btn-toggle:hover { background:#e2e8f0; }')
+    [void]$sb.AppendLine('  .empty-note { color:var(--muted); font-size:14px; margin:2px 0; }')
     [void]$sb.AppendLine('  .bullet-list { list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:10px; }')
-    [void]$sb.AppendLine('  .bullet-item { padding:12px 14px; border-radius:8px; border:1px solid var(--border); background:#f8fafc; }')
+    [void]$sb.AppendLine('  .bullet-item { padding:12px 15px; border-radius:8px; border:1px solid var(--border); border-left:4px solid var(--border); background:#f8fafc; }')
+    [void]$sb.AppendLine('  .bullet-fixed { border-left-color:#0284c7; background:#f0f9ff; }')
+    [void]$sb.AppendLine('  .bullet-high { border-left-color:#dc2626; background:#fef2f2; }')
+    [void]$sb.AppendLine('  .bullet-med { border-left-color:#d97706; background:#fffbeb; }')
+    [void]$sb.AppendLine('  .bullet-info { border-left-color:#0284c7; background:#f8fafc; }')
+    [void]$sb.AppendLine('  .bullet-maint { border-left-color:#64748b; background:#f8fafc; padding:10px 14px; }')
     [void]$sb.AppendLine('  .item-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px; }')
-    [void]$sb.AppendLine('  .sev { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; text-transform:uppercase; }')
+    [void]$sb.AppendLine('  .sev { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; text-transform:uppercase; letter-spacing:0.04em; }')
     [void]$sb.AppendLine('  .sev-high { background:var(--err-bg); color:var(--err); }')
     [void]$sb.AppendLine('  .sev-med { background:var(--warn-bg); color:var(--warn); }')
     [void]$sb.AppendLine('  .sev-info { background:var(--fixed-bg); color:var(--fixed); }')
     [void]$sb.AppendLine('  .src-tag { font-size:12px; font-weight:600; color:var(--muted); }')
-    [void]$sb.AppendLine('  .action-text { font-size:13px; color:#334155; margin-top:4px; }')
-    [void]$sb.AppendLine('  .check-card { border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:12px; background:#ffffff; }')
+    [void]$sb.AppendLine('  .item-title { font-size:14px; font-weight:600; color:var(--text); word-break:break-word; }')
+    [void]$sb.AppendLine('  .action-text { font-size:13px; color:#334155; margin-top:4px; word-break:break-word; }')
+    [void]$sb.AppendLine('  .check-card { border:1px solid var(--border); border-left:4px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:12px; background:#ffffff; }')
     [void]$sb.AppendLine('  .check-card:last-child { margin-bottom:0; }')
+    [void]$sb.AppendLine('  .accent-ok { border-left-color:#16a34a; }')
+    [void]$sb.AppendLine('  .accent-fixed { border-left-color:#0284c7; }')
+    [void]$sb.AppendLine('  .accent-warn { border-left-color:#d97706; }')
+    [void]$sb.AppendLine('  .accent-err { border-left-color:#dc2626; }')
+    [void]$sb.AppendLine('  .accent-pending { border-left-color:#7c3aed; }')
+    [void]$sb.AppendLine('  .accent-skip { border-left-color:#cbd5e1; opacity:0.8; }')
     [void]$sb.AppendLine('  .check-head { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }')
     [void]$sb.AppendLine('  .check-title { font-size:15px; font-weight:700; }')
     [void]$sb.AppendLine('  .badge { font-size:11px; font-weight:700; padding:3px 10px; border-radius:999px; text-transform:uppercase; letter-spacing:0.04em; }')
@@ -921,16 +1000,18 @@ function New-ScanHtmlReport {
     [void]$sb.AppendLine('  .badge-err { background:var(--err-bg); color:var(--err); }')
     [void]$sb.AppendLine('  .badge-pending { background:var(--pend-bg); color:var(--pend); }')
     [void]$sb.AppendLine('  .badge-skip { background:#f1f5f9; color:#64748b; }')
+    [void]$sb.AppendLine('  .badge-maint { background:var(--maint-bg); color:var(--maint); }')
     [void]$sb.AppendLine('  .badge-info { background:#e2e8f0; color:#334155; }')
     [void]$sb.AppendLine('  .check-meta { font-size:12px; color:var(--muted); margin:4px 0 6px 0; font-family:Consolas,monospace; }')
     [void]$sb.AppendLine('  .check-sum { font-size:14px; margin:4px 0 8px 0; }')
     [void]$sb.AppendLine('  details { margin-top:6px; }')
     [void]$sb.AppendLine('  summary { cursor:pointer; font-size:13px; font-weight:600; color:#0369a1; user-select:none; }')
-    [void]$sb.AppendLine('  pre { background:#0f172a; color:#e2e8f0; padding:12px; border-radius:8px; overflow-x:auto; font-size:12px; line-height:1.45; margin:8px 0 0 0; white-space:pre-wrap; word-break:break-word; }')
+    [void]$sb.AppendLine('  pre { background:#0f172a; color:#e2e8f0; padding:12px 14px; border-radius:8px; overflow:auto; max-height:420px; font-size:12px; line-height:1.45; margin:8px 0 0 0; white-space:pre-wrap; word-break:break-word; }')
     [void]$sb.AppendLine('  .ext-link { display:inline-block; margin-top:6px; font-size:13px; color:#0284c7; text-decoration:none; font-weight:600; }')
     [void]$sb.AppendLine('  .ext-link:hover { text-decoration:underline; }')
-    [void]$sb.AppendLine('  .footer { font-size:12px; color:var(--muted); padding:8px 4px; }')
+    [void]$sb.AppendLine('  .footer { font-size:12px; color:var(--muted); padding:8px 4px; display:flex; flex-direction:column; gap:4px; }')
     [void]$sb.AppendLine('  code { background:#e2e8f0; padding:1px 5px; border-radius:4px; font-family:Consolas,monospace; font-size:12px; color:#0f172a; }')
+    [void]$sb.AppendLine('  @media print { body { background:#ffffff; padding:0; } .hero { background:#0f172a !important; -webkit-print-color-adjust:exact; print-color-adjust:exact; } .btn-toggle { display:none; } pre { max-height:none; } }')
     [void]$sb.AppendLine('</style>')
     [void]$sb.AppendLine('</head>')
     [void]$sb.AppendLine('<body>')
@@ -941,13 +1022,16 @@ function New-ScanHtmlReport {
     [void]$sb.AppendLine('    <div class="hero-top">')
     [void]$sb.AppendLine('      <div>')
     [void]$sb.AppendLine('        <h1>Windows Scan &amp; Fix Report</h1>')
-    [void]$sb.AppendLine("        <div class=""hero-meta"">PC: <strong>$computerName</strong> | User: <strong>$userName</strong> | OS: $osCaption</div>")
+    [void]$sb.AppendLine('        <div class="meta-row">')
+    [void]$sb.AppendLine("          <span class=""meta-chip"">PC: <strong>$computerName</strong></span>")
+    [void]$sb.AppendLine("          <span class=""meta-chip"">User: <strong>$userName</strong></span>")
+    [void]$sb.AppendLine("          <span class=""meta-chip"">$osCaption</span>")
+    [void]$sb.AppendLine("          <span class=""meta-chip"">Started: $timestampDisplay</span>")
+    [void]$sb.AppendLine("          <span class=""meta-chip"">Duration: $durationDisplay</span>")
     if ($postReboot -and -not [string]::IsNullOrWhiteSpace($finalizedTime)) {
-        $finEsc = Escape-Html $finalizedTime
-        [void]$sb.AppendLine("        <div class=""hero-meta"">Started: $timestampDisplay | Scan Duration: $durationDisplay | Finalized after reboot: $finEsc</div>")
-    } else {
-        [void]$sb.AppendLine("        <div class=""hero-meta"">Started: $timestampDisplay | Scan Duration: $durationDisplay</div>")
+        [void]$sb.AppendLine("          <span class=""meta-chip"">Post-Reboot: $(Escape-Html $finalizedTime)</span>")
     }
+    [void]$sb.AppendLine('        </div>')
     [void]$sb.AppendLine('      </div>')
     [void]$sb.AppendLine("      <div class=""overall-pill $overallClass"">$overallLabel</div>")
     [void]$sb.AppendLine('    </div>')
@@ -955,32 +1039,37 @@ function New-ScanHtmlReport {
     [void]$sb.AppendLine('  </div>')
 
     # KPIs
+    $runSub = if ($skippedCount -gt 0) { "of $totalCount ($skippedCount skipped)" } else { "of $totalCount checks" }
+    $attnColor = if ($highCount -gt 0) { 'var(--err)' } elseif ($attentionCount -gt 0) { 'var(--warn)' } else { 'var(--ok)' }
+    $attnSub = if ($highCount -gt 0) { "$highCount high priority" } elseif ($attentionCount -gt 0) { 'review recommended' } else { 'all clear' }
+    $fixedSub = if ($fixedCardCount -gt 0) { "$fixedCardCount check(s) repaired" } else { 'no repairs needed' }
     [void]$sb.AppendLine('  <div class="kpis">')
-    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"">$runCount</div><div class=""kpi-lbl"">Checks Run</div></div>")
-    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--fixed)"">$fixedCount</div><div class=""kpi-lbl"">Issues Fixed</div></div>")
-    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--warn)"">$attentionCount</div><div class=""kpi-lbl"">Need Attention</div></div>")
-    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--ok)"">$okCount</div><div class=""kpi-lbl"">Passed Clean</div></div>")
+    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"">$runCount</div><div class=""kpi-lbl"">Checks Run</div><div class=""kpi-sub"">$runSub</div></div>")
+    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--fixed)"">$fixedCount</div><div class=""kpi-lbl"">Issues Fixed</div><div class=""kpi-sub"">$fixedSub</div></div>")
+    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:$attnColor"">$attentionCount</div><div class=""kpi-lbl"">Need Attention</div><div class=""kpi-sub"">$attnSub</div></div>")
+    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--ok)"">$okCount</div><div class=""kpi-lbl"">Passed Clean</div><div class=""kpi-sub"">healthy checks</div></div>")
+    [void]$sb.AppendLine("    <div class=""kpi""><div class=""kpi-num"" style=""color:var(--maint)"">$maintCount</div><div class=""kpi-lbl"">Maintenance</div><div class=""kpi-sub"">routine tune-ups</div></div>")
     [void]$sb.AppendLine('  </div>')
 
     # Section 1: What Was Fixed
     [void]$sb.AppendLine('  <div class="section">')
-    [void]$sb.AppendLine('    <h2>1. What Was Fixed</h2>')
+    [void]$sb.AppendLine('    <div class="sec-head"><h2>1. What Was Fixed</h2></div>')
     if ($fixedCount -eq 0) {
-        [void]$sb.AppendLine('    <p class="empty-note">No automatic repairs were needed &ndash; Windows system files, component store, drives, and security scans required no fixes.</p>')
+        [void]$sb.AppendLine('    <p class="empty-note">No repairs were needed &ndash; Windows system files, component store, drives, and security checks were already healthy.</p>')
     } else {
         [void]$sb.AppendLine('    <ul class="bullet-list">')
         foreach ($item in $fixedItems) {
             $src = Escape-Html ([string](Get-SafeProp $item 'Source' 'Repair'))
             $desc = Escape-Html ([string](Get-SafeProp $item 'Description' ''))
-            [void]$sb.AppendLine("      <li class=""bullet-item""><div class=""item-head""><span class=""badge badge-fixed"">FIXED</span><span class=""src-tag"">$src</span></div><div>$desc</div></li>")
+            [void]$sb.AppendLine("      <li class=""bullet-item bullet-fixed""><div class=""item-head""><span class=""badge badge-fixed"">FIXED</span><span class=""src-tag"">$src</span></div><div class=""item-title"">$desc</div></li>")
         }
         [void]$sb.AppendLine('    </ul>')
     }
     [void]$sb.AppendLine('  </div>')
 
-    # Section 2: Things You May Need to Look At
+    # Section 2: Things You May Need to Look At (sorted High -> Medium -> Info)
     [void]$sb.AppendLine('  <div class="section">')
-    [void]$sb.AppendLine('    <h2>2. Things You May Need to Look At</h2>')
+    [void]$sb.AppendLine('    <div class="sec-head"><h2>2. Things You May Need to Look At</h2></div>')
     if ($attentionCount -eq 0) {
         [void]$sb.AppendLine('    <p class="empty-note">Nothing requires your attention right now.</p>')
     } else {
@@ -988,30 +1077,48 @@ function New-ScanHtmlReport {
         foreach ($item in $attentionItems) {
             $sev = [string](Get-SafeProp $item 'Severity' 'Info')
             $sevClass = Get-SeverityClass $sev
+            $bulletCls = switch ($sev) { 'High' { 'bullet-high' } 'Medium' { 'bullet-med' } default { 'bullet-info' } }
             $src = Escape-Html ([string](Get-SafeProp $item 'Source' 'Check'))
             $title = Escape-Html ([string](Get-SafeProp $item 'Title' ''))
             $action = Escape-Html ([string](Get-SafeProp $item 'Action' ''))
-            [void]$sb.AppendLine("      <li class=""bullet-item""><div class=""item-head""><span class=""sev $sevClass"">$(Escape-Html $sev)</span><span class=""src-tag"">$src</span></div><div><strong>$title</strong></div><div class=""action-text"">$action</div></li>")
+            [void]$sb.AppendLine("      <li class=""bullet-item $bulletCls""><div class=""item-head""><span class=""sev $sevClass"">$(Escape-Html $sev)</span><span class=""src-tag"">$src</span></div><div class=""item-title"">$title</div><div class=""action-text""><strong>Next step:</strong> $action</div></li>")
         }
         [void]$sb.AppendLine('    </ul>')
     }
     [void]$sb.AppendLine('  </div>')
 
-    # Section 3: Detailed Results
+    # Section 3: Routine Maintenance Performed
     [void]$sb.AppendLine('  <div class="section">')
-    [void]$sb.AppendLine("    <h2>3. Detailed Results (All $totalCount Checks)</h2>")
+    [void]$sb.AppendLine('    <div class="sec-head"><h2>3. Routine Maintenance Performed</h2></div>')
+    if ($maintCount -eq 0) {
+        [void]$sb.AppendLine('    <p class="empty-note">No routine maintenance tasks were run.</p>')
+    } else {
+        [void]$sb.AppendLine('    <ul class="bullet-list">')
+        foreach ($item in $maintItems) {
+            $src = Escape-Html ([string](Get-SafeProp $item 'Source' 'Maintenance'))
+            $desc = Escape-Html ([string](Get-SafeProp $item 'Description' ''))
+            [void]$sb.AppendLine("      <li class=""bullet-item bullet-maint""><div class=""item-head""><span class=""badge badge-maint"">MAINT</span><span class=""src-tag"">$src</span></div><div class=""action-text"" style=""margin-top:0"">$desc</div></li>")
+        }
+        [void]$sb.AppendLine('    </ul>')
+    }
+    [void]$sb.AppendLine('  </div>')
+
+    # Section 4: Detailed Results
+    [void]$sb.AppendLine('  <div class="section">')
+    [void]$sb.AppendLine("    <div class=""sec-head""><h2>4. Detailed Results (All $totalCount Checks)</h2><button type=""button"" class=""btn-toggle"" onclick=""var d=document.querySelectorAll('.check-card details');var open=Array.prototype.some.call(d,function(x){return !x.open;});d.forEach(function(x){x.open=open;});this.textContent=open?'Collapse All Details':'Expand All Details';"">Expand All Details</button></div>")
     foreach ($r in $results) {
         $name = Escape-Html ([string](Get-SafeProp $r 'Name' ''))
         $cmd = Escape-Html ([string](Get-SafeProp $r 'Command' ''))
         $status = [string](Get-SafeProp $r 'Status' 'INFO')
         $badgeClass = Get-BadgeClass $status
+        $accentClass = Get-CardAccentClass $status
         $dur = Escape-Html ([string](Get-SafeProp $r 'Duration' ''))
         $summary = Escape-Html ([string](Get-SafeProp $r 'Summary' ''))
         $details = [string](Get-SafeProp $r 'Details' '')
         $extraPath = [string](Get-SafeProp $r 'ExtraLinkPath' '')
         $extraLabel = Escape-Html ([string](Get-SafeProp $r 'ExtraLinkLabel' 'Open report'))
 
-        [void]$sb.AppendLine('    <div class="check-card">')
+        [void]$sb.AppendLine("    <div class=""check-card $accentClass"">")
         [void]$sb.AppendLine('      <div class="check-head">')
         [void]$sb.AppendLine("        <div class=""check-title"">$name</div>")
         [void]$sb.AppendLine("        <span class=""badge $badgeClass"">$(Escape-Html $status)</span>")
@@ -1019,7 +1126,8 @@ function New-ScanHtmlReport {
         [void]$sb.AppendLine("      <div class=""check-meta"">$cmd | Duration: $dur</div>")
         [void]$sb.AppendLine("      <div class=""check-sum"">$summary</div>")
         if (-not [string]::IsNullOrWhiteSpace($extraPath)) {
-            $fileUri = 'file:///' + ($extraPath.Replace('\', '/').TrimStart('/'))
+            try { $fileUri = [System.Uri]::new($extraPath).AbsoluteUri }
+            catch { $fileUri = 'file:///' + ($extraPath.Replace('\', '/').TrimStart('/') -replace ' ', '%20') }
             [void]$sb.AppendLine("      <div><a class=""ext-link"" href=""$(Escape-Html $fileUri)"" target=""_blank"">$extraLabel</a> (<code>$(Escape-Html $extraPath)</code>)</div>")
         }
         if (-not [string]::IsNullOrWhiteSpace($details)) {
@@ -1034,8 +1142,8 @@ function New-ScanHtmlReport {
 
     # Footer
     [void]$sb.AppendLine('  <div class="footer">')
-    [void]$sb.AppendLine("    <div><strong>Saved Reports:</strong> Desktop copy: <code>$desktopReportPath</code> | Archive copy: <code>$archiveReportPath</code></div>")
-    [void]$sb.AppendLine("    <div><strong>Raw Logs:</strong> Script log: <code>$rawLogPath</code> | PowerCfg Energy: <code>$energyHtmlPath</code> | SFC: <code>C:\Windows\Logs\CBS\CBS.log</code> | DISM: <code>C:\Windows\Logs\DISM\dism.log</code></div>")
+    [void]$sb.AppendLine("    <div><strong>Saved Reports:</strong> Desktop: <code>$desktopReportPath</code> | Archive: <code>$archiveReportPath</code></div>")
+    [void]$sb.AppendLine("    <div><strong>Logs:</strong> Scan log: <code>$rawLogPath</code> | PowerCfg: <code>$energyHtmlPath</code> | SFC: <code>C:\Windows\Logs\CBS\CBS.log</code> | DISM: <code>C:\Windows\Logs\DISM\dism.log</code></div>")
     [void]$sb.AppendLine('    <div>Tip: Press <code>Win + R</code> and run <code>perfmon /rel</code> anytime to view the interactive Windows Reliability Monitor timeline.</div>')
     [void]$sb.AppendLine('  </div>')
 
@@ -1200,6 +1308,7 @@ if ([bool](Get-SafeProp $state 'OfflineChkdskScheduled' $false)) {
     }
 }
 
+$state | Add-Member -NotePropertyName MaintenanceItems -NotePropertyValue @(Get-SafeProp $state 'MaintenanceItems' @()) -Force
 $state | Add-Member -NotePropertyName FixedItems -NotePropertyValue @($fixedList.ToArray()) -Force
 $state | Add-Member -NotePropertyName AttentionItems -NotePropertyValue @($attentionList.ToArray()) -Force
 $state | Add-Member -NotePropertyName Results -NotePropertyValue @($resultsList.ToArray()) -Force
@@ -1274,6 +1383,24 @@ function Invoke-WindowsScanAndFix {
         exit 0
     }
 
+    try {
+        try {
+            if (-not ('ScanExecutionState' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class ScanExecutionState {
+    public const uint Continuous = 0x80000000u;
+    public const uint SystemRequired = 0x00000001u;
+
+    [DllImport("kernel32.dll")]
+    public static extern uint SetThreadExecutionState(uint flags);
+}
+'@
+            }
+            [void][ScanExecutionState]::SetThreadExecutionState([ScanExecutionState]::Continuous -bor [ScanExecutionState]::SystemRequired)
+        } catch {}
+
     $scanStart = Get-Date
     $stamp = $scanStart.ToString('yyyy-MM-dd_HH-mm-ss')
 
@@ -1324,6 +1451,8 @@ function Invoke-WindowsScanAndFix {
     $ui = New-ScanUiState -Config $config -ScanStart $scanStart -RawLogPath $rawLogPath
 
     $dismRepairable = $false
+    $dismHealthy = $false
+    $maintenanceItems = New-Object 'System.Collections.Generic.List[object]'
     $memDiagScheduled = $false
     $offlineChkdskScheduled = $false
 
@@ -1412,7 +1541,16 @@ function Invoke-WindowsScanAndFix {
                             $rErr = Get-SafeProp $rel 'ReadErrorsUncorrected' $null
                             $wErr = Get-SafeProp $rel 'WriteErrorsUncorrected' $null
                             $hours = Get-SafeProp $rel 'PowerOnHours' $null
-                            $smartNote = "Temp=$($temp)C, Wear=$($wear)%, UncorrectedReadErr=$rErr, UncorrectedWriteErr=$wErr, PowerOnHours=$hours"
+                            $smartNote = @(
+                                if ($null -ne $temp) { "Temp=$($temp)C" }
+                                if ($null -ne $wear) { "Wear=$($wear)%" }
+                                if ($null -ne $rErr) { "UncorrectedReadErr=$rErr" }
+                                if ($null -ne $wErr) { "UncorrectedWriteErr=$wErr" }
+                                if ($null -ne $hours) { "PowerOnHours=$hours" }
+                            ) -join ', '
+                            if ([string]::IsNullOrWhiteSpace($smartNote)) {
+                                $smartNote = 'SMART counters unavailable on this controller'
+                            }
                         }
                     } catch {}
 
@@ -1534,28 +1672,19 @@ function Invoke-WindowsScanAndFix {
             if ($pwrOut -match '(\d+)\s+Warnings?') { $warnCount = [int]$matches[1] }
             if ($pwrOut -match '(\d+)\s+Informational') { $infoCount = [int]$matches[1] }
 
-            $topErrors = New-Object 'System.Collections.Generic.List[string]'
+            $energyErrors = @()
             if (Test-Path -LiteralPath $energyHtmlPath) {
-                try {
-                    $eHtml = [System.IO.File]::ReadAllText($energyHtmlPath, [System.Text.Encoding]::UTF8)
-                    $mList = [regex]::Matches($eHtml, '(?is)<tr[^>]*class="[^"]*err-tr[^"]*"[^>]*>([\s\S]*?)</tr>')
-                    if ($mList.Count -eq 0) {
-                        $mList = [regex]::Matches($eHtml, '(?is)<div[^>]*class="[^"]*error-log-entry[^"]*"[^>]*>[\s\S]*?<div[^>]*class="[^"]*log-entry-header[^"]*"[^>]*>([\s\S]*?)</div>')
-                    }
-                    foreach ($m in $mList) {
-                        $clean = [System.Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim())
-                        if (-not [string]::IsNullOrWhiteSpace($clean) -and -not $topErrors.Contains($clean)) {
-                            $topErrors.Add($clean)
-                            if ($topErrors.Count -ge 10) { break }
-                        }
-                    }
-                } catch {}
+                try { $energyErrors = @(Get-EnergyReportErrors ([IO.File]::ReadAllText($energyHtmlPath))) } catch {}
             }
+            $topErrors = @($energyErrors | ForEach-Object { $_.Text })
+            $desktopConfirmed = $false
 
-            $batteryNote = 'Battery: None (desktop)'
+            $batteryNote = 'Battery: status unavailable'
             $batteryLowHealth = $false
             try {
-                $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+                $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop)
+                $desktopConfirmed = $batteries.Count -eq 0
+                if ($desktopConfirmed) { $batteryNote = 'Battery: None (desktop)' }
                 if ($batteries.Count -gt 0) {
                     $batRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'powercfg.exe') -Arguments "/batteryreport /output `"$batteryHtmlPath`"" -OnTick { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint 'Generating battery report...' }
                     Write-RawLog ($batRes.Output + "`r`n" + $batRes.Error).Trim() $rawLogPath
@@ -1587,7 +1716,7 @@ function Invoke-WindowsScanAndFix {
             $detailsList.Add($batteryNote)
             if ($topErrors.Count -gt 0) {
                 $detailsList.Add('')
-                $detailsList.Add('Top Error Entries:')
+                $detailsList.Add('Error Entries:')
                 foreach ($te in $topErrors) { $detailsList.Add("  - $te") }
             }
             if (-not [string]::IsNullOrWhiteSpace($pwrOut)) {
@@ -1595,15 +1724,28 @@ function Invoke-WindowsScanAndFix {
                 $detailsList.Add($pwrOut)
             }
 
-            if ($errCount -gt 0 -or $batteryLowHealth) {
+            $otherEnergyErrors = @($energyErrors | Where-Object {
+                $_.Title -notmatch '^(Power Policy:\s*(Power Plan Personality is High Performance|Disk idle is disabled|Minimum processor performance state|PCI Express ASPM)|Platform Power Management Capabilities:\s*PCI Express Active-State Power Management)'
+            })
+            $powerPlanErrCount = [math]::Max(0, $energyErrors.Count - $otherEnergyErrors.Count)
+            if ($desktopConfirmed -and $errCount -gt 0 -and $energyErrors.Count -eq $errCount -and $otherEnergyErrors.Count -eq 0) {
+                $status = 'OK'
+                $summary = "$errCount High Performance power-plan note(s) (intentional on desktop). $batteryNote"
+                $detailsList.Add('Note: Desktop High Performance power settings are typically intentional.')
+            } elseif ($errCount -gt 0 -or $batteryLowHealth) {
                 $status = 'ATTENTION'
-                $summary = "$errCount error(s), $warnCount warning(s). $batteryNote"
+                $breakdown = if ($desktopConfirmed -and $powerPlanErrCount -gt 0) {
+                    "$errCount error(s) ($powerPlanErrCount desktop High Performance, $($otherEnergyErrors.Count) other), $warnCount warning(s)"
+                } else {
+                    "$errCount error(s), $warnCount warning(s)"
+                }
+                $summary = "$breakdown. $batteryNote"
                 if ($errCount -gt 0) {
-                    $topSnippet = if ($topErrors.Count -gt 0) { ' Top finding: ' + $topErrors[0] } else { '' }
+                    $topSnippet = if ($otherEnergyErrors.Count -gt 0) { ' Top finding: ' + $otherEnergyErrors[0].Title } elseif ($topErrors.Count -gt 0) { ' Top finding: ' + $topErrors[0] } else { '' }
                     $attentionItems.Add([PSCustomObject]@{
                         Severity='Medium'; Source='Power & Energy (powercfg /energy)'
-                        Title="Powercfg energy trace reported $errCount error(s) and $warnCount warning(s)."
-                        Action="Open $energyHtmlPath to review power policy, USB suspend, or sleep issues.$topSnippet"
+                        Title="Powercfg energy trace reported $breakdown."
+                        Action="Open energy-report.html to review USB suspend, sleep, or driver power issues.$topSnippet"
                     })
                 }
             } elseif ($pwrRes.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $energyHtmlPath)) {
@@ -1660,7 +1802,7 @@ function Invoke-WindowsScanAndFix {
                 $null -ne $tg -and $tg -ge $cutoff
             })
 
-            $osCrashes = 0; $appIssues = 0; $updateFails = 0; $msiFails = 0
+            $osCrashes = 0; $appIssues = 0; $osUpdateFails = 0; $storeUpdateFails = 0; $msiFails = 0
             $grouped = @{}
             foreach ($rec in $records) {
                 $src = [string](Get-SafeProp $rec 'SourceName' '')
@@ -1684,7 +1826,11 @@ function Invoke-WindowsScanAndFix {
                 } elseif ($src -eq 'Application Hang' -and $evId -eq 1002) {
                     $cat = 'Application Hang'; $appIssues++
                 } elseif ($src -eq 'Microsoft-Windows-WindowsUpdateClient' -and $evId -eq 20) {
-                    $cat = 'Windows Update Failure'; $updateFails++
+                    if ($prod -match '^[0-9A-Z]{12}-') {
+                        $cat = 'Microsoft Store App Update Failure'; $storeUpdateFails++
+                    } else {
+                        $cat = 'Windows OS Update Failure'; $osUpdateFails++
+                    }
                 } elseif ($src -eq 'MsiInstaller' -and $evId -eq 1033) {
                     $cat = 'Installer Failure'; $msiFails++
                 } elseif ($msg -match 'stopped working|unexpectedly|hardware error|faulting|failed') {
@@ -1719,10 +1865,15 @@ function Invoke-WindowsScanAndFix {
                 $minidumps = @(Get-ChildItem -LiteralPath $dumpDir -Filter '*.dmp' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cutoff } | Sort-Object LastWriteTime -Descending)
             }
 
+            $topApps = @($grouped.Values | Where-Object { $_.Category -in @('Application Crash', 'Application Hang') } |
+                Group-Object Item | ForEach-Object {
+                    [PSCustomObject]@{ Name=$_.Name; Count=($_.Group | Measure-Object Count -Sum).Sum }
+                } | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count)x)" })
+            $topAppsNote = if ($topApps.Count -gt 0) { ' Top apps: ' + ($topApps -join ', ') + '.' } else { '' }
             $scoreText = if ($null -ne $latestScore) { "$latestScore/10" } else { 'N/A' }
             $relLines = New-Object 'System.Collections.Generic.List[string]'
             $relLines.Add("Current System Stability Index: $scoreText")
-            $relLines.Add("Last 30 Days: OS/Unexpected Shutdowns=$osCrashes, App Crashes/Hangs=$appIssues, Update Failures=$updateFails, Installer Failures=$msiFails")
+            $relLines.Add("Last 30 Days: OS/Unexpected Shutdowns=$osCrashes, App Crashes/Hangs=$appIssues, OsUpdateFails=$osUpdateFails, StoreUpdateFails=$storeUpdateFails, Installer Failures=$msiFails")
             $relLines.Add("Hardware/Disk Critical+Error Events (30d): $($hwEvents.Count) | BSOD Minidumps (30d): $($minidumps.Count)")
             $topGrouped = @($grouped.Values | Sort-Object @{Expression='Count';Descending=$true}, @{Expression='Latest';Descending=$true} | Select-Object -First 12)
             if ($topGrouped.Count -gt 0) {
@@ -1755,7 +1906,7 @@ function Invoke-WindowsScanAndFix {
                 $attentionItems.Add([PSCustomObject]@{
                     Severity='High'; Source='Hardware / Crash Logs (System Event Log)'
                     Title="Found $($hwEvents.Count) hardware/disk error event(s) and $($minidumps.Count) BSOD minidump(s) in the last 30 days."
-                    Action='Review Reliability details or inspect Event Viewer -> Windows Logs -> System.'
+                    Action='Review Reliability details or inspect Event Viewer -> Windows Logs -> System.' + $topAppsNote
                 })
             }
             if ($osCrashes -gt 0) {
@@ -1763,23 +1914,23 @@ function Invoke-WindowsScanAndFix {
                 $attentionItems.Add([PSCustomObject]@{
                     Severity='High'; Source='Reliability History (perfmon /rel)'
                     Title="$osCrashes OS crash(es) or unexpected shutdown(s) in the last 30 days (Stability: $scoreText)."
-                    Action='Press Win+R and run "perfmon /rel" to inspect crash events on the timeline.'
+                    Action='Press Win+R and run "perfmon /rel" to inspect crash events on the timeline.' + $topAppsNote
                 })
             } elseif ($hwEvents.Count -gt 0 -or $minidumps.Count -gt 0) {
                 $status = 'ATTENTION'
-            } elseif (($null -ne $latestScore -and $latestScore -lt 5.0) -or $appIssues -ge 5 -or $updateFails -gt 0) {
+            } elseif (($null -ne $latestScore -and $latestScore -lt 5.0) -or $appIssues -ge 5 -or $osUpdateFails -gt 0) {
                 $status = 'ATTENTION'
                 $attentionItems.Add([PSCustomObject]@{
                     Severity='Medium'; Source='Reliability History (perfmon /rel)'
-                    Title="Stability Index is $scoreText ($appIssues app crash/hang(s), $updateFails failed update(s) in last 30 days)."
-                    Action='Run "perfmon /rel" to see which apps or updates had issues.'
+                    Title="Stability Index is $scoreText ($appIssues app crash/hang(s), $osUpdateFails failed Windows OS update(s) in last 30 days)."
+                    Action='Run "perfmon /rel" to see which apps or updates had issues.' + $topAppsNote
                 })
             } else {
                 $status = 'OK'
             }
 
             $dur = Format-DurationSpan ((Get-Date) - $stepStart)
-            $summary = "Stability $scoreText | OS:$osCrashes App:$appIssues UpdFail:$updateFails HW:$($hwEvents.Count)"
+            $summary = "Stability $scoreText | OS:$osCrashes App:$appIssues UpdFail:$osUpdateFails HW:$($hwEvents.Count)"
             $results.Add([PSCustomObject]@{
                 Id='reliability'; Order=3; Name='3. Reliability History & Crash/Hardware Logs'; Command='perfmon /rel + WHEA/Disk/NTFS Event Logs + Minidumps'
                 Status=$status; Duration=$dur; Summary=$summary; Details=$relDetails; ExtraLinkPath=''; ExtraLinkLabel=''
@@ -2045,11 +2196,11 @@ function Invoke-WindowsScanAndFix {
         try {
             $dismTick = { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint $(if ($h) { "DISM ScanHealth: $h" } else { 'Scanning Windows component store...' }) }
             $dismScan = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /ScanHealth' -OnTick $dismTick
-            $scanOut = ($dismScan.Output + "`r`n" + $dismScan.Error).Trim()
+            $scanOut = Format-CleanToolOutput ($dismScan.Output + "`r`n" + $dismScan.Error)
             Write-RawLog $scanOut $rawLogPath
 
             $dismRepairable = ($scanOut -match 'component store is repairable')
-            $dismHealthy = ($scanOut -match 'No component store corruption detected')
+            $dismHealthy = ($dismScan.ExitCode -eq 0 -and $scanOut -match 'No component store corruption detected')
             $dismUnrepairable = ($scanOut -match 'not repairable|cannot be repaired')
 
             if ($dismScan.ExitCode -eq 0 -and $dismHealthy) {
@@ -2057,7 +2208,7 @@ function Invoke-WindowsScanAndFix {
                 $summary = 'No component store corruption detected'
             } elseif ($dismRepairable) {
                 $status = 'ATTENTION'
-                $summary = 'Repairable corruption found (Step 8 will fix)'
+                $summary = 'Repairable corruption found'
             } elseif ($dismUnrepairable) {
                 $status = 'ATTENTION'
                 $summary = 'Unrepairable component store corruption'
@@ -2100,30 +2251,54 @@ function Invoke-WindowsScanAndFix {
         Write-RawLog "`r`n--- [8/15] DISM /RestoreHealth & /StartComponentCleanup ---" $rawLogPath
         try {
             $rTick = { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint $(if ($h) { "DISM RestoreHealth: $h" } else { 'Running DISM /RestoreHealth...' }) }
-            $dismRestore = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /RestoreHealth' -OnTick $rTick
-            $restOut = ($dismRestore.Output + "`r`n" + $dismRestore.Error).Trim()
+            if ($dismHealthy) {
+                $dismRestore = [PSCustomObject]@{ ExitCode=0; Output='/RestoreHealth skipped because Step 7 confirmed the component store is healthy.'; Error='' }
+            } else {
+                $dismRestore = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /RestoreHealth' -OnTick $rTick
+            }
+            $restOut = Format-CleanToolOutput ($dismRestore.Output + "`r`n" + $dismRestore.Error)
             Write-RawLog $restOut $rawLogPath
 
             $cleanupNote = ''
             $cleanupOut = ''
             if ($dismRestore.ExitCode -in @(0, 3010)) {
+                if ($dismRepairable -and -not $dismHealthy) {
+                    $scanCard = $results | Where-Object { $_.Id -eq 'dism_scan' } | Select-Object -First 1
+                    if ($null -ne $scanCard) {
+                        $scanCard.Status = 'OK'
+                        $scanCard.Summary = 'Repairable corruption detected -> Repaired in Step 8'
+                        Set-StepDone 7 $scanCard.Status $scanCard.Duration $scanCard.Summary
+                    }
+                    $fixedItems.Add([PSCustomObject]@{
+                        Source      = 'DISM (/RestoreHealth)'
+                        Description = 'Repaired Windows component store corruption.'
+                    })
+                }
                 $cTick = { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint $(if ($h) { "DISM ComponentCleanup: $h" } else { 'Running DISM /StartComponentCleanup...' }) }
                 $dismClean = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'DISM.exe') -Arguments '/Online /Cleanup-Image /StartComponentCleanup' -OnTick $cTick
-                $cleanupOut = ($dismClean.Output + "`r`n" + $dismClean.Error).Trim()
+                $cleanupOut = Format-CleanToolOutput ($dismClean.Output + "`r`n" + $dismClean.Error)
                 Write-RawLog $cleanupOut $rawLogPath
-                if ($dismClean.ExitCode -in @(0, 3010)) { $cleanupNote = ' + WinSxS cleaned' }
+                if ($dismClean.ExitCode -in @(0, 3010)) {
+                    $cleanupNote = ' | WinSxS cleanup completed'
+                    if ($dismClean.ExitCode -eq 3010) { $cleanupNote += ' (restart required)' }
+                    $maintenanceItems.Add([PSCustomObject]@{ Source='DISM (/StartComponentCleanup)'; Description='Completed routine WinSxS component cleanup.' })
+                } else {
+                    $cleanupNote = " | WinSxS cleanup exited $($dismClean.ExitCode)"
+                    $attentionItems.Add([PSCustomObject]@{
+                        Severity='Medium'; Source='DISM (/StartComponentCleanup)'
+                        Title="WinSxS cleanup exited $($dismClean.ExitCode)."
+                        Action='Inspect C:\Windows\Logs\DISM\dism.log.'
+                    })
+                }
 
                 $rebootNote = if ($dismRestore.ExitCode -eq 3010) { ' (restart required)' } else { '' }
-                if ($dismRepairable) {
+                if ($dismRepairable -and -not $dismHealthy) {
                     $status = 'FIXED'
                     $summary = "Repaired component store$cleanupNote$rebootNote"
-                    $fixedItems.Add([PSCustomObject]@{
-                        Source      = 'DISM (/RestoreHealth + /StartComponentCleanup)'
-                        Description = "Repaired Windows component store corruption and cleaned superseded WinSxS packages$rebootNote."
-                    })
                 } else {
-                    $status = 'OK'
-                    $summary = "Component store healthy$cleanupNote$rebootNote"
+                    $status = if ($dismClean.ExitCode -in @(0, 3010)) { 'OK' } else { 'ATTENTION' }
+                    $restoreNote = if ($dismHealthy) { $restOut } else { 'Component store healthy' }
+                    $summary = "$restoreNote$cleanupNote$rebootNote"
                 }
             } else {
                 $status = 'ATTENTION'
@@ -2174,7 +2349,7 @@ function Invoke-WindowsScanAndFix {
         try {
             $sfcTick = { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint $(if ($h) { "SFC verification: $h" } else { 'Scanning protected Windows system files...' }) }
             $sfcRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'sfc.exe') -Arguments '/scannow' -Encoding 'Unicode' -OnTick $sfcTick
-            $sfcOut = ($sfcRes.Output + "`r`n" + $sfcRes.Error).Trim()
+            $sfcOut = Format-CleanToolOutput ($sfcRes.Output + "`r`n" + $sfcRes.Error)
             Write-RawLog $sfcOut $rawLogPath
 
             $sfcDetails = $sfcOut
@@ -2294,7 +2469,7 @@ function Invoke-WindowsScanAndFix {
 
                 if ($fs -ieq 'NTFS') {
                     $chkRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'chkdsk.exe') -Arguments "$drive /scan" -OnTick $dTick
-                    $chkOut = ($chkRes.Output + "`r`n" + $chkRes.Error).Trim()
+                    $chkOut = Format-CleanToolOutput ($chkRes.Output + "`r`n" + $chkRes.Error)
                     Write-RawLog $chkOut $rawLogPath
                     $driveOutputs.Add("=== Drive $drive ($labelTag) [chkdsk $drive /scan, exit $($chkRes.ExitCode)] ===`r`n$chkOut")
 
@@ -2330,7 +2505,7 @@ function Invoke-WindowsScanAndFix {
                     }
                 } elseif ($fs -iin @('FAT', 'FAT32', 'EXFAT')) {
                     $chkRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'chkdsk.exe') -Arguments "$drive" -OnTick $dTick
-                    $chkOut = ($chkRes.Output + "`r`n" + $chkRes.Error).Trim()
+                    $chkOut = Format-CleanToolOutput ($chkRes.Output + "`r`n" + $chkRes.Error)
                     Write-RawLog $chkOut $rawLogPath
                     $driveOutputs.Add("=== Drive $drive ($labelTag) [chkdsk $drive, exit $($chkRes.ExitCode)] ===`r`n$chkOut")
 
@@ -2427,19 +2602,18 @@ function Invoke-WindowsScanAndFix {
             $optDetails = $optLines -join "`r`n"
             Write-RawLog $optDetails $rawLogPath
 
-            $didWork = ($trimmedDrives.Count -gt 0 -or $mbFreed -ge 10)
-            if ($didWork) {
-                $parts = New-Object 'System.Collections.Generic.List[string]'
-                if ($trimmedDrives.Count -gt 0) { $parts.Add("Ran SSD TRIM on $($trimmedDrives -join ', ')") }
-                if ($mbFreed -ge 10) { $parts.Add("cleaned $filesRemoved stale temp file(s) (${mbFreed} MB freed)") }
-                $fixedItems.Add([PSCustomObject]@{
-                    Source      = 'SSD Optimization & Temp Cleanup'
-                    Description = ($parts -join ' and ') + '.'
-                })
+            if ($trimmedDrives.Count -gt 0) {
+                $maintenanceItems.Add([PSCustomObject]@{ Source='SSD Optimization'; Description="Ran SSD TRIM on $($trimmedDrives -join ', ')." })
+            }
+            $largeCleanup = $bytesFreed -ge 100MB
+            if ($filesRemoved -gt 0) {
+                $cleanupItem = [PSCustomObject]@{ Source='Temp Cleanup'; Description="Removed $filesRemoved stale temp file(s) ($($mbFreed) MB freed)." }
+                if ($largeCleanup) { $fixedItems.Add($cleanupItem) }
+                else { $maintenanceItems.Add($cleanupItem) }
             }
 
             $dur = Format-DurationSpan ((Get-Date) - $stepStart)
-            $st = if ($didWork) { 'FIXED' } else { 'OK' }
+            $st = if ($largeCleanup) { 'FIXED' } else { 'OK' }
             $summary = "TRIM: $(if ($trimmedDrives.Count -gt 0) { $trimmedDrives -join ',' } else { 'None' }) | Freed: ${mbFreed} MB ($filesRemoved files)"
             $results.Add([PSCustomObject]@{
                 Id='opt_cleanup'; Order=11; Name='11. SSD TRIM & Safe Temp Cleanup'; Command='Optimize-Volume -ReTrim + Stale Temp (>24h) Cleanup'
@@ -2469,7 +2643,6 @@ function Invoke-WindowsScanAndFix {
         Write-RawLog "`r`n--- [12/15] ipconfig /flushdns + netsh winsock reset + w32tm /resync ---" $rawLogPath
         try {
             $netLines = New-Object 'System.Collections.Generic.List[string]'
-            $netOk = $true
             $nTick = { param($h) Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint 'Refreshing DNS, Winsock & clock...' }
 
             $dnsRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'ipconfig.exe') -Arguments '/flushdns' -OnTick $nTick
@@ -2477,7 +2650,7 @@ function Invoke-WindowsScanAndFix {
 
             $wsRes = Invoke-ConsoleTool -FilePath (Join-Path $sysDir 'netsh.exe') -Arguments 'winsock reset' -OnTick $nTick
             $netLines.Add("=== netsh winsock reset (exit $($wsRes.ExitCode)) ===`r`n$($wsRes.Output.Trim())")
-            if ($wsRes.ExitCode -ne 0) { $netOk = $false }
+            $netOk = $dnsRes.ExitCode -eq 0 -and $wsRes.ExitCode -eq 0
 
             $timeNote = 'Clock sync skipped'
             try {
@@ -2495,16 +2668,25 @@ function Invoke-WindowsScanAndFix {
             $netDetails = $netLines -join "`r`n`r`n"
             Write-RawLog $netDetails $rawLogPath
 
-            if ($dnsRes.ExitCode -eq 0 -or $wsRes.ExitCode -eq 0) {
-                $fixedItems.Add([PSCustomObject]@{
-                    Source      = 'Network Stack & Clock Sync'
-                    Description = "Flushed DNS cache, reset Winsock catalog (applies on restart; Wi-Fi/static IPs preserved), and ran Windows Time sync ($timeNote)."
-                })
+            $netActions = @(
+                if ($dnsRes.ExitCode -eq 0) { 'Flushed DNS cache' }
+                if ($wsRes.ExitCode -eq 0) { 'Reset Winsock catalog (applies on restart)' }
+                if ($timeNote -eq 'Clock synced') { 'Requested Windows Time resync' }
+            )
+            if ($netActions.Count -gt 0) {
+                $maintenanceItems.Add([PSCustomObject]@{ Source='Network Stack & Clock Sync'; Description=($netActions -join '. ') + '.' })
             }
 
             $dur = Format-DurationSpan ((Get-Date) - $stepStart)
-            $st = if ($netOk) { 'FIXED' } else { 'ATTENTION' }
-            $summary = "DNS flushed, Winsock reset, $timeNote"
+            $st = if ($netOk) { 'OK' } else { 'ATTENTION' }
+            if (-not $netOk) {
+                $attentionItems.Add([PSCustomObject]@{
+                    Severity='Medium'; Source='Network Stack & Clock Sync'
+                    Title="Network stack refresh had a non-zero exit (DNS: $($dnsRes.ExitCode), Winsock: $($wsRes.ExitCode))."
+                    Action='Inspect Step 12 details or run "ipconfig /flushdns" and "netsh winsock reset" as Administrator.'
+                })
+            }
+            $summary = if ($netOk) { "DNS flushed, Winsock reset, $timeNote" } else { "DNS exit $($dnsRes.ExitCode) | Winsock exit $($wsRes.ExitCode) | $timeNote" }
             $results.Add([PSCustomObject]@{
                 Id='network_time'; Order=12; Name='12. Network Stack, DNS & Clock Sync'; Command='ipconfig /flushdns + netsh winsock reset + w32tm /resync'
                 Status=$st; Duration=$dur; Summary=$summary; Details=$netDetails; ExtraLinkPath=''; ExtraLinkLabel=''
@@ -2637,8 +2819,24 @@ function Invoke-WindowsScanAndFix {
             }).AddArgument($defMode)
 
             $async = $psRun.BeginInvoke()
+            $nextPoll = $mpStart
+            $liveHint = "Microsoft Defender ($defMode) scanning..."
             while (-not $async.IsCompleted) {
-                Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint "Microsoft Defender ($defMode) scanning..."
+                $now = Get-Date
+                if ($now -ge $nextPoll) {
+                    $nextPoll = $now.AddSeconds(10)
+                    try {
+                        $events = @(Get-WinEvent -FilterHashtable @{
+                            LogName='Microsoft-Windows-Windows Defender/Operational'; Id=1116; StartTime=$mpStart
+                        } -MaxEvents 1 -ErrorAction Stop)
+                        if ($events.Count -gt 0) {
+                            $nameNode = ([xml]$events[0].ToXml()).SelectSingleNode('//*[local-name()="Data" and @Name="Threat Name"]')
+                            $liveHint = 'Microsoft Defender detected a threat'
+                            if ($null -ne $nameNode -and -not [string]::IsNullOrWhiteSpace($nameNode.InnerText)) { $liveHint += ": $($nameNode.InnerText)" }
+                        }
+                    } catch {}
+                }
+                Update-ActiveStatusLine -UiState $ui -StepStart $stepStart -Hint $liveHint
                 Start-Sleep -Milliseconds 250
             }
             [void]$psRun.EndInvoke($async)
@@ -2648,11 +2846,10 @@ function Invoke-WindowsScanAndFix {
 
             $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object {
                 $detTime = Get-SafeProp $_ 'InitialDetectionTime' ([datetime]::MinValue)
-                $detTime -ge $mpStart.AddMinutes(-1)
+                $detTime -ge $mpStart.AddSeconds(-5)
             })
-            $activeThreats = @(Get-MpThreat -ErrorAction SilentlyContinue | Where-Object {
-                [bool](Get-SafeProp $_ 'IsActive' $false)
-            })
+            $threats = @(Get-MpThreat -ErrorAction SilentlyContinue)
+            $activeThreats = @($threats | Where-Object { [bool](Get-SafeProp $_ 'IsActive' $false) })
             $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
             $sigVer = [string](Get-SafeProp $mpStatus 'AntivirusSignatureVersion' 'Unknown')
 
@@ -2662,24 +2859,83 @@ function Invoke-WindowsScanAndFix {
             $mpDetailLines.Add("Detections during this scan: $($detections.Count)")
             $mpDetailLines.Add("Active threats remaining: $($activeThreats.Count)")
 
-            if ($activeThreats.Count -gt 0) {
-                foreach ($at in $activeThreats) {
-                    $mpDetailLines.Add("  - ACTIVE THREAT: $([string](Get-SafeProp $at 'ThreatName' 'Unknown Threat'))")
+            $pendingThreats = @()
+            $remediatedThreats = @()
+            $seenThreatIds = @()
+            foreach ($detection in $detections) {
+                $id = Get-SafeProp $detection 'ThreatID' $null
+                $threat = $null
+                if ($null -ne $id) {
+                    $seenThreatIds += $id
+                    $threat = $threats | Where-Object { (Get-SafeProp $_ 'ThreatID' $null) -eq $id } | Select-Object -First 1
                 }
+                $name = Get-SafeProp $threat 'ThreatName' (Get-SafeProp $detection 'ThreatName' "Threat ID $id")
+                $paths = @(@(Get-SafeProp $detection 'Resources' @()) + @(Get-SafeProp $threat 'Resources' @()) |
+                    Where-Object { $_ } | Sort-Object -Unique)
+                $brief = $name
+                if ($paths.Count -gt 0) { $brief += " [$($paths -join ', ')]" }
+                $sevId = Get-SafeProp $threat 'SeverityID' (Get-SafeProp $detection 'SeverityID' $null)
+                $sevLabel = switch ([string]$sevId) {
+                    '1' { 'Low' }
+                    '2' { 'Moderate' }
+                    '4' { 'High' }
+                    '5' { 'Severe' }
+                    default { if ($null -ne $sevId) { "Level $sevId" } else { 'Unknown' } }
+                }
+                $threatStatus = Get-SafeProp $detection 'ThreatStatusID' 'Unknown'
+                $active = [bool](Get-SafeProp $threat 'IsActive' $false)
+                $actionSuccess = [bool](Get-SafeProp $detection 'ActionSuccess' $false)
+                $statusLabel = switch ([string]$threatStatus) {
+                    '1' { 'Detected' }
+                    '2' { 'Cleaned' }
+                    '3' { 'Quarantined' }
+                    '4' { 'Removed' }
+                    '5' { 'Allowed' }
+                    '6' { 'Blocked' }
+                    default { 'Unresolved' }
+                }
+                $mpDetailLines.Add("  - $brief | Severity: $sevLabel | Status: $statusLabel | Active: $active | Remediated: $actionSuccess")
+                if (-not $active -and $actionSuccess -and ([string]$threatStatus -in @('2', '3', '4', '6'))) {
+                    $remediatedThreats += $brief
+                } else {
+                    $pendingThreats += $brief
+                }
+            }
+            foreach ($threat in $activeThreats) {
+                if ($seenThreatIds -contains (Get-SafeProp $threat 'ThreatID' $null)) { continue }
+                $name = Get-SafeProp $threat 'ThreatName' 'Unknown threat'
+                $paths = @(Get-SafeProp $threat 'Resources' @() | Where-Object { $_ })
+                $brief = $name
+                if ($paths.Count -gt 0) { $brief += " [$($paths -join ', ')]" }
+                $sevId = Get-SafeProp $threat 'SeverityID' $null
+                $sevLabel = switch ([string]$sevId) {
+                    '1' { 'Low' }
+                    '2' { 'Moderate' }
+                    '4' { 'High' }
+                    '5' { 'Severe' }
+                    default { if ($null -ne $sevId) { "Level $sevId" } else { 'Unknown' } }
+                }
+                $mpDetailLines.Add("  - $brief | Severity: $sevLabel | Status: Active")
+                $pendingThreats += $brief
+            }
+
+            if ($remediatedThreats.Count -gt 0) {
+                $fixedItems.Add([PSCustomObject]@{
+                    Source="Microsoft Defender ($defMode)"
+                    Description="Remediated: $($remediatedThreats -join '; ')"
+                })
+            }
+            if ($pendingThreats.Count -gt 0) {
                 $status = 'ATTENTION'
-                $summary = "$($activeThreats.Count) active threat(s) found!"
+                $summary = "$($pendingThreats.Count) threat detection(s) require review"
                 $attentionItems.Add([PSCustomObject]@{
                     Severity='High'; Source="Microsoft Defender ($defMode)"
-                    Title="$($activeThreats.Count) active threat(s) remain after Microsoft Defender $defMode."
-                    Action='Open Windows Security -> Virus & threat protection -> Protection history immediately.'
+                    Title="Threats requiring review: $($pendingThreats -join '; ')"
+                    Action='Open Windows Security -> Virus & threat protection -> Protection history.'
                 })
-            } elseif ($detections.Count -gt 0) {
+            } elseif ($remediatedThreats.Count -gt 0) {
                 $status = 'FIXED'
-                $summary = "Detected & remediated $($detections.Count) threat(s)"
-                $fixedItems.Add([PSCustomObject]@{
-                    Source      = "Microsoft Defender ($defMode)"
-                    Description = "Antivirus scan detected and quarantined/remediated $($detections.Count) threat(s)."
-                })
+                $summary = "Remediated $($remediatedThreats.Count) detection(s)"
             } else {
                 $status = 'OK'
                 $summary = "Clean - no threats found ($defMode)"
@@ -2801,6 +3057,7 @@ function Invoke-WindowsScanAndFix {
         ArchiveReportPath      = $archiveReportPath
         RawLogPath             = $rawLogPath
         EnergyHtmlPath         = $energyHtmlPath
+        MaintenanceItems       = @($maintenanceItems.ToArray())
         FixedItems             = @($fixedItems.ToArray())
         AttentionItems         = @($attentionItems.ToArray())
         Results                = @($results.ToArray())
@@ -2853,8 +3110,17 @@ function Invoke-WindowsScanAndFix {
     if ($attentionItems.Count -eq 0) {
         Write-Host '    (Nothing needs your attention right now)' -ForegroundColor Gray
     } else {
-        foreach ($ai in $attentionItems) {
-            Write-Host "    [$($ai.Severity)] $($ai.Source): $($ai.Title)" -ForegroundColor Yellow
+        $sortedAttn = @($attentionItems | Sort-Object { switch ([string]$_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } })
+        foreach ($ai in $sortedAttn) {
+            $aiColor = switch ([string]$ai.Severity) { 'High' { 'Red' } 'Medium' { 'Yellow' } default { 'Cyan' } }
+            Write-Host "    [$($ai.Severity)] $($ai.Source): $($ai.Title)" -ForegroundColor $aiColor
+        }
+    }
+    if ($maintenanceItems.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  ROUTINE MAINTENANCE:' -ForegroundColor DarkCyan
+        foreach ($mi in $maintenanceItems) {
+            Write-Host "    [MAINT] $($mi.Source): $($mi.Description)" -ForegroundColor Gray
         }
     }
     Write-Host ''
@@ -2873,7 +3139,7 @@ function Invoke-WindowsScanAndFix {
         }
         Write-Host ''
         & "$sysDir\shutdown.exe" /r /t 5 /d p:2:2 /c "Windows Scan and Fix complete. Restarting your computer now..."
-        exit 0
+        return
     } else {
         if ($config.OpenReport) {
             $openTarget = if (Test-Path -LiteralPath $desktopReportPath) { $desktopReportPath } else { $archiveReportPath }
@@ -2884,7 +3150,11 @@ function Invoke-WindowsScanAndFix {
         }
         Write-Host '  Done! Press Enter to close this window.' -ForegroundColor Cyan
         [void](Read-Host)
-        exit 0
+        return
+    }
+    } finally {
+        try { [void][ScanExecutionState]::SetThreadExecutionState([ScanExecutionState]::Continuous) } catch {}
+        try { [Console]::CursorVisible = $true } catch {}
     }
 }
 
